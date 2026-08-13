@@ -6,5 +6,5 @@
     "types": ["bun"]
   },
   "include": ["src"],
-  "references": [{ "path": "../core" }, { "path": "../slskd-client" }]
+  "references": [{ "path": "../addon-sdk" }, { "path": "../slskd-client" }]
 }
