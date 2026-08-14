@@ -1,0 +1,25 @@
+{
+  "name": "nicotind-slskd-addon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "author": "Kevin Chavarria",
+  "description": "The Soulseek (slskd) acquisition addon for NicotinD — an out-of-process, Torrentio-style HTTP addon speaking the NicotinD acquisition addon protocol v1.",
+  "homepage": "https://github.com/kevinch3/nicotind-slskd-addon",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kevinch3/nicotind-slskd-addon.git"
+  },
+  "workspaces": ["packages/*"],
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "typescript": "^6.0.3"
+  },
+  "scripts": {
+    "start": "bun run packages/slskd-addon/src/main.ts",
+    "typecheck": "tsc --build",
+    "gen:schema": "bun run packages/addon-sdk/src/scripts/gen-addon-schema.ts",
+    "test": "bun test packages/addon-sdk/src packages/slskd-client/src packages/slskd-addon/src"
+  }
+}

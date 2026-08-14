@@ -27,7 +27,7 @@ describe('published addon-protocol JSON Schema', () => {
   });
 
   it('the committed docs/addon-protocol/v1/schema.json is up to date', () => {
-    // Drift guard: if this fails, run `bun run packages/core/src/scripts/gen-addon-schema.ts`.
+    // Drift guard: if this fails, run `bun run gen:schema`.
     expect(readFileSync(committed, 'utf8')).toBe(serializeAddonProtocolSchema());
   });
 });
