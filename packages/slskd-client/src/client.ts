@@ -1,5 +1,21 @@
 import { createLogger, type Logger } from '@nicotind/addon-sdk';
 
+/**
+ * A non-2xx response from slskd, carrying the HTTP `status` so callers can react
+ * to it — notably a **429** on `POST /searches` when slskd rate-limits a burst
+ * of concurrent searches, which the album hunter retries with backoff (#hunt-429).
+ */
+export class SlskdRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly path: string,
+  ) {
+    super(message);
+    this.name = 'SlskdRequestError';
+  }
+}
+
 export interface SlskdClientOptions {
   baseUrl: string;
   username: string;
@@ -40,7 +56,7 @@ export class SlskdClient {
     const res = await this.fetchWithAuth(`${this.baseUrl}/api/v0${path}`, options);
 
     if (!res.ok) {
-      throw new Error(`slskd request failed: ${res.status} ${path}`);
+      throw new SlskdRequestError(`slskd request failed: ${res.status} ${path}`, res.status, path);
     }
 
     const contentType = res.headers.get('content-type');
@@ -54,7 +70,7 @@ export class SlskdClient {
     const res = await this.fetchWithAuth(`${this.baseUrl}/api/v0${path}`, options);
 
     if (!res.ok) {
-      throw new Error(`slskd request failed: ${res.status} ${path}`);
+      throw new SlskdRequestError(`slskd request failed: ${res.status} ${path}`, res.status, path);
     }
 
     return res.text();

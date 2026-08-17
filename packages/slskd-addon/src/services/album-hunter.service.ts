@@ -1,4 +1,4 @@
-import type { Slskd } from '@nicotind/slskd-client';
+import { SlskdRequestError, type Slskd } from '@nicotind/slskd-client';
 import {
   createLogger,
   baseQueries,
@@ -43,6 +43,36 @@ const POLL_INTERVAL_MS = 2_000;
 // Latin-American material — often only respond late in the window; cutting off
 // at 30s dropped otherwise-complete folders before they could be scored.
 const HUNT_TIMEOUT_MS = 45_000;
+
+// Search-create throttle (#hunt-429). slskd rate-limits POST /searches and
+// returns 429 for a burst — firing every base+skew query at once (the old
+// unbounded Promise.all) tripped it, silently dropping queries so a hunt for a
+// less-seeded album could find nothing. Cap concurrent creates and retry a 429
+// with backoff; only a query still 429ing after all retries counts as
+// rate-limited (surfaced to the user as "still searching", vs a genuine miss).
+const SEARCH_CREATE_CONCURRENCY = 3;
+const SEARCH_429_MAX_RETRIES = 3;
+const SEARCH_429_BACKOFF_MS = 500;
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** Run `fn` over `items` with at most `limit` in flight; preserves order. */
+async function mapPool<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]!, i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
 
 // Low server-side floor so we don't return hundreds of junk folders. All
 // finer filtering (FLAC-only, live, higher match %) happens reactively on the
@@ -146,6 +176,17 @@ export interface FolderCandidate {
   freeUploadSlots: number;
   queueLength: number;
   uploadSpeed: number;
+}
+
+/**
+ * The outcome of a hunt: the scored folder candidates plus whether the search
+ * was **rate-limited** by slskd (429s that survived retry). `rateLimited` lets
+ * the UI tell "still searching, slskd is throttling us — hang on" apart from a
+ * genuine "no results on Soulseek", instead of both looking like an empty hunt.
+ */
+export interface HuntResult {
+  candidates: FolderCandidate[];
+  rateLimited: boolean;
 }
 
 // Minimal structural shape of a slskd search response the recognizer needs. A
@@ -290,7 +331,7 @@ export class AlbumHunterService {
     albumTitle: string,
     canonicalTracks: CanonicalTrackRef[],
     opts: { skewSearch?: boolean } = {},
-  ): Promise<FolderCandidate[]> {
+  ): Promise<HuntResult> {
     const baseQs = baseQueries(artistName, albumTitle);
 
     const base = await this.searchAndScore(baseQs, canonicalTracks);
@@ -302,12 +343,15 @@ export class AlbumHunterService {
     // candidate is confidently complete (best match < SKEW_TRIGGER_PCT). A junk
     // partial folder would otherwise keep the base non-empty and hide a complete
     // folder reachable only via a skewed phrase. A strong base adds no searches.
-    const bestBasePct = base.length ? base[0].matchPct : 0;
+    const bestBasePct = base.candidates.length ? base.candidates[0].matchPct : 0;
     if (opts.skewSearch && bestBasePct < SKEW_TRIGGER_PCT) {
       const skewed = buildSkewedQueries(artistName, albumTitle, baseQs);
       if (skewed.length) {
         const extra = await this.searchAndScore(skewed, canonicalTracks);
-        return mergeCandidates(base, extra);
+        return {
+          candidates: mergeCandidates(base.candidates, extra.candidates),
+          rateLimited: base.rateLimited || extra.rateLimited,
+        };
       }
     }
 
@@ -321,16 +365,21 @@ export class AlbumHunterService {
     albumTitle: string,
     canonicalTracks: CanonicalTrackRef[],
     opts: { skewSearch?: boolean } = {},
-  ): Promise<{ candidates: FolderCandidate[]; skewNeeded: boolean; responses: ScoreResponse[] }> {
+  ): Promise<{
+    candidates: FolderCandidate[];
+    skewNeeded: boolean;
+    responses: ScoreResponse[];
+    rateLimited: boolean;
+  }> {
     const baseQs = baseQueries(artistName, albumTitle);
     // Keep the raw responses (not just the scored candidates): feedback capture
     // snapshots them so a replay fixture can re-run scoreFolders offline —
     // including sub-floor folders the recognizer wrongly dropped.
-    const responses = await this.search(baseQs);
+    const { responses, rateLimited } = await this.search(baseQs);
     const candidates = scoreFolders(canonicalTracks, responses);
     const bestBasePct = candidates.length ? candidates[0].matchPct : 0;
     const skewNeeded = opts.skewSearch !== false && bestBasePct < SKEW_TRIGGER_PCT;
-    return { candidates, skewNeeded, responses };
+    return { candidates, skewNeeded, responses, rateLimited };
   }
 
   // Phase-2 of a two-phase hunt: run skew-variant queries and return their
@@ -339,43 +388,62 @@ export class AlbumHunterService {
     artistName: string,
     albumTitle: string,
     canonicalTracks: CanonicalTrackRef[],
-  ): Promise<FolderCandidate[]> {
+  ): Promise<HuntResult> {
     const baseQs = baseQueries(artistName, albumTitle);
     const skewed = buildSkewedQueries(artistName, albumTitle, baseQs);
-    if (!skewed.length) return [];
+    if (!skewed.length) return { candidates: [], rateLimited: false };
     return this.searchAndScore(skewed, canonicalTracks);
   }
 
   private async searchAndScore(
     queries: string[],
     canonicalTracks: CanonicalTrackRef[],
-  ): Promise<FolderCandidate[]> {
-    return scoreFolders(canonicalTracks, await this.search(queries));
+  ): Promise<HuntResult> {
+    const { responses, rateLimited } = await this.search(queries);
+    return { candidates: scoreFolders(canonicalTracks, responses), rateLimited };
   }
 
-  // The I/O half of a hunt: create the searches, poll to completion, clean up,
-  // and return the raw slskd responses. Kept separate from `scoreFolders` (the
-  // pure recognizer) so a hunt can surface its raw responses for feedback
-  // capture without re-running the network.
-  private async search(queries: string[]): Promise<ScoreResponse[]> {
-    // Fire all searches in parallel
-    const searches = await Promise.all(
-      queries.map((q) =>
-        this.slskd.searches.create(q).catch((err) => {
-          log.warn({ q, err }, 'Search create failed');
-          return null;
-        }),
-      ),
-    );
+  // Create one search, retrying a 429 (slskd rate-limiting the burst) with
+  // backoff. Returns the search, or null with `rateLimited` telling the caller
+  // whether the null was a rate-limit (retryable — "still searching") or a real
+  // failure (a genuine miss). A non-429 error is not retried.
+  private async createSearch(q: string): Promise<{ search: { id: string } | null; rateLimited: boolean }> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return { search: await this.slskd.searches.create(q), rateLimited: false };
+      } catch (err) {
+        const is429 = err instanceof SlskdRequestError && err.status === 429;
+        if (is429 && attempt < SEARCH_429_MAX_RETRIES) {
+          await sleep(SEARCH_429_BACKOFF_MS * (attempt + 1));
+          continue;
+        }
+        log.warn({ q, err }, 'Search create failed');
+        return { search: null, rateLimited: is429 };
+      }
+    }
+  }
 
-    const searchIds = searches.filter(Boolean).map((s) => s!.id);
-    if (!searchIds.length) return [];
+  // The I/O half of a hunt: create the searches (bounded concurrency + 429
+  // retry), poll to completion, clean up, and return the raw slskd responses +
+  // whether any query stayed rate-limited after retries. Kept separate from
+  // `scoreFolders` (the pure recognizer) so a hunt can surface its raw responses
+  // for feedback capture without re-running the network.
+  private async search(queries: string[]): Promise<{ responses: ScoreResponse[]; rateLimited: boolean }> {
+    const created = await mapPool(queries, SEARCH_CREATE_CONCURRENCY, (q) => this.createSearch(q));
+    const searchIds = created.map((c) => c.search?.id).filter((id): id is string => Boolean(id));
+    // Rate-limited only if a query was dropped to a 429 *and* we didn't otherwise
+    // get results — an incomplete hunt the user can retry, not a genuine miss.
+    const rateLimited = created.some((c) => c.rateLimited) && searchIds.length < queries.length;
+    if (!searchIds.length) return { responses: [], rateLimited: created.some((c) => c.rateLimited) };
 
     try {
-      return await this.pollUntilDone(searchIds);
+      return { responses: await this.pollUntilDone(searchIds), rateLimited };
     } finally {
-      // Clean up searches
-      await Promise.all(searchIds.map((id) => this.slskd.searches.delete(id).catch(() => {})));
+      // Clean up searches (bounded — the same burst that 429s creates also 429s
+      // deletes, and leaked searches pile up in slskd's history).
+      await mapPool(searchIds, SEARCH_CREATE_CONCURRENCY, (id) =>
+        this.slskd.searches.delete(id).catch(() => {}),
+      );
     }
   }
 

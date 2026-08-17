@@ -146,9 +146,12 @@ export function createProtocolRoutes(deps: ProtocolRouteDeps): Hono {
     try {
       const base = await hunter.huntBase(artist, album, canonicalTracks, { skewSearch: true });
       let folderCandidates = base.candidates;
+      let rateLimited = base.rateLimited;
       const skewRan = skew === true || base.skewNeeded;
       if (skewRan) {
-        folderCandidates = await hunter.hunt(artist, album, canonicalTracks, { skewSearch: true });
+        const full = await hunter.hunt(artist, album, canonicalTracks, { skewSearch: true });
+        folderCandidates = full.candidates;
+        rateLimited = rateLimited || full.rateLimited;
       }
       const queries = [
         ...baseQueries(artist, album),
@@ -158,6 +161,10 @@ export function createProtocolRoutes(deps: ProtocolRouteDeps): Hono {
         candidates: candidates.put(folderCandidates),
         queries,
         skewNeeded: base.skewNeeded,
+        // slskd throttled the search burst (429) and some queries were dropped —
+        // the hunt may be incomplete, so the UI keeps trying rather than reporting
+        // a genuine "no results". Omitted when false to keep the wire additive.
+        ...(rateLimited ? { rateLimited: true } : {}),
       };
       return c.json(body);
     } catch (err) {

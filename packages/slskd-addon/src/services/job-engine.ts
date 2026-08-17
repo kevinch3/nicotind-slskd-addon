@@ -87,7 +87,7 @@ async function executeAlbumJob(deps: JobEngineDeps, req: AddonJobRequest): Promi
     best = resolved.candidate;
     siblings = resolved.siblings;
   } else {
-    const candidates = await deps.hunter.hunt(req.artist, req.album, canonicalTracks, {
+    const { candidates } = await deps.hunter.hunt(req.artist, req.album, canonicalTracks, {
       skewSearch: true,
     });
     const threshold = req.minMatchPct ?? 0;
