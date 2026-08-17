@@ -1,5 +1,5 @@
 import { describe, it, expect, mock } from 'bun:test';
-import type { Slskd } from '@nicotind/slskd-client';
+import { SlskdRequestError, type Slskd } from '@nicotind/slskd-client';
 import {
   AlbumHunterService,
   buildSkewedQueries,
@@ -77,7 +77,7 @@ describe('AlbumHunterService', () => {
     ]);
 
     const hunter = new AlbumHunterService(slskd);
-    const candidates = await hunter.hunt('Artist', 'Album', TRACKS);
+    const { candidates } = await hunter.hunt('Artist', 'Album', TRACKS);
 
     // Two distinct folders
     expect(candidates).toHaveLength(2);
@@ -106,7 +106,7 @@ describe('AlbumHunterService', () => {
     ]);
 
     const hunter = new AlbumHunterService(slskd);
-    const [candidate] = await hunter.hunt('Artist', 'Album', TRACKS);
+    const { candidates: [candidate] } = await hunter.hunt('Artist', 'Album', TRACKS);
     expect(candidate.format).toBe('MP3 320kbps');
   });
 
@@ -122,7 +122,7 @@ describe('AlbumHunterService', () => {
     ]);
 
     const hunter = new AlbumHunterService(slskd);
-    const [candidate] = await hunter.hunt('Artist', 'Album', TRACKS);
+    const { candidates: [candidate] } = await hunter.hunt('Artist', 'Album', TRACKS);
     expect(candidate.isLive).toBe(true);
   });
 
@@ -135,7 +135,7 @@ describe('AlbumHunterService', () => {
     ]);
 
     const hunter = new AlbumHunterService(slskd);
-    const candidates = await hunter.hunt('Artist', 'Album', TRACKS);
+    const { candidates } = await hunter.hunt('Artist', 'Album', TRACKS);
     expect(candidates).toHaveLength(0);
   });
 
@@ -168,7 +168,7 @@ describe('AlbumHunterService', () => {
     ]);
 
     const hunter = new AlbumHunterService(slskd);
-    const candidates = await hunter.hunt('Artist', 'Album', tenTracks);
+    const { candidates } = await hunter.hunt('Artist', 'Album', tenTracks);
 
     expect(candidates[0].username).toBe('healthy');
     expect(candidates[0].freeUploadSlots).toBe(2);
@@ -189,7 +189,7 @@ describe('AlbumHunterService', () => {
     ]);
 
     const hunter = new AlbumHunterService(slskd);
-    const [candidate] = await hunter.hunt('Artist', 'Album', TRACKS);
+    const { candidates: [candidate] } = await hunter.hunt('Artist', 'Album', TRACKS);
     expect(candidate.files).toHaveLength(2);
   });
 
@@ -199,7 +199,7 @@ describe('AlbumHunterService', () => {
         { username: 'sia', files: [{ filename: 'Sia/Chandelier/Chandelier.flac', size: 1 }] },
       ]);
       const hunter = new AlbumHunterService(slskd);
-      const candidates = await hunter.hunt('Sia', 'Chandelier', [track(1, 'Chandelier')]);
+      const { candidates } = await hunter.hunt('Sia', 'Chandelier', [track(1, 'Chandelier')]);
       expect(candidates).toHaveLength(1);
       expect(candidates[0].matchPct).toBe(100);
       expect(candidates[0].matchedTracks).toBe(1);
@@ -212,7 +212,7 @@ describe('AlbumHunterService', () => {
         { username: 'kygo', files: [{ filename: 'Kygo/Stay/01 Stay.mp3', size: 1, bitRate: 320 }] },
       ]);
       const hunter = new AlbumHunterService(slskd);
-      const candidates = await hunter.hunt('Kygo', 'Stay (feat. Justin Bieber)', [
+      const { candidates } = await hunter.hunt('Kygo', 'Stay (feat. Justin Bieber)', [
         track(1, 'Stay (feat. Justin Bieber)'),
       ]);
       expect(candidates).toHaveLength(1);
@@ -230,7 +230,7 @@ describe('AlbumHunterService', () => {
         },
       ]);
       const hunter = new AlbumHunterService(slskd);
-      const candidates = await hunter.hunt('Kygo', 'Stay (feat. Justin Bieber)', [
+      const { candidates } = await hunter.hunt('Kygo', 'Stay (feat. Justin Bieber)', [
         track(1, 'Stay (feat. Justin Bieber)'),
       ]);
       expect(candidates[0].username).toBe('exact');
@@ -243,7 +243,7 @@ describe('AlbumHunterService', () => {
         { username: 'nope', files: [{ filename: 'X/Y/something else entirely.mp3', size: 1 }] },
       ]);
       const hunter = new AlbumHunterService(slskd);
-      const candidates = await hunter.hunt('Sia', 'Chandelier', [track(1, 'Chandelier')]);
+      const { candidates } = await hunter.hunt('Sia', 'Chandelier', [track(1, 'Chandelier')]);
       expect(candidates).toHaveLength(0);
     });
 
@@ -259,7 +259,7 @@ describe('AlbumHunterService', () => {
         },
       ]);
       const hunter = new AlbumHunterService(slskd);
-      const [candidate] = await hunter.hunt('Artist', 'EP', ep);
+      const { candidates: [candidate] } = await hunter.hunt('Artist', 'EP', ep);
       expect(candidate.matchedTracks).toBe(2);
       expect(candidate.matchPct).toBe(67);
     });
@@ -557,7 +557,7 @@ describe('AlbumHunterService', () => {
       const slskd = makeQueryAwareSlskdStub({ Album: [fullAlbum] });
 
       const hunter = new AlbumHunterService(slskd);
-      const candidates = await hunter.hunt('Artist', 'Album', TRACKS, { skewSearch: true });
+      const { candidates } = await hunter.hunt('Artist', 'Album', TRACKS, { skewSearch: true });
 
       expect(candidates).toHaveLength(1);
       expect(candidates[0].username).toBe('zoe');
@@ -575,7 +575,7 @@ describe('AlbumHunterService', () => {
       const slskd = makeQueryAwareSlskdStub({ Album: [fullAlbum] });
 
       const hunter = new AlbumHunterService(slskd);
-      const candidates = await hunter.hunt('Artist', 'Album', TRACKS);
+      const { candidates } = await hunter.hunt('Artist', 'Album', TRACKS);
 
       expect(candidates).toHaveLength(0);
       const created = (slskd.searches.create as ReturnType<typeof mock>).mock.calls.map(
@@ -597,7 +597,7 @@ describe('AlbumHunterService', () => {
       });
 
       const hunter = new AlbumHunterService(slskd);
-      const candidates = await hunter.hunt('Artist', 'Album', TRACKS, { skewSearch: true });
+      const { candidates } = await hunter.hunt('Artist', 'Album', TRACKS, { skewSearch: true });
 
       // Both the weak base folder and the complete skew folder are present.
       expect(candidates).toHaveLength(2);
@@ -623,7 +623,7 @@ describe('AlbumHunterService', () => {
       });
 
       const hunter = new AlbumHunterService(slskd);
-      const candidates = await hunter.hunt('Artist', 'Album', TRACKS, { skewSearch: true });
+      const { candidates } = await hunter.hunt('Artist', 'Album', TRACKS, { skewSearch: true });
 
       expect(candidates).toHaveLength(1);
       expect(candidates[0].matchPct).toBe(100);
@@ -633,7 +633,7 @@ describe('AlbumHunterService', () => {
       const slskd = makeQueryAwareSlskdStub({ 'Artist Album': [fullAlbum] });
 
       const hunter = new AlbumHunterService(slskd);
-      const candidates = await hunter.hunt('Artist', 'Album', TRACKS, { skewSearch: true });
+      const { candidates } = await hunter.hunt('Artist', 'Album', TRACKS, { skewSearch: true });
 
       expect(candidates).toHaveLength(1);
       expect(candidates[0].matchPct).toBe(100);
@@ -641,6 +641,75 @@ describe('AlbumHunterService', () => {
         (c) => c[0],
       );
       expect(created).toEqual(['Artist Album', 'Artist - Album']);
+    });
+  });
+
+  // Search-create throttle handling (#hunt-429). A found folder for a stub file.
+  const HIT: StubResponse[] = [
+    {
+      username: 'peer',
+      files: [
+        { filename: 'Music/Artist/Album/01 Song One.flac', size: 1_000_000 },
+        { filename: 'Music/Artist/Album/02 Song Two.flac', size: 1_000_000 },
+        { filename: 'Music/Artist/Album/03 Song Three.flac', size: 1_000_000 },
+      ],
+    },
+  ];
+  const err429 = () => new SlskdRequestError('slskd request failed: 429 /searches', 429, '/searches');
+
+  function throttledStub(behavior: (q: string, attempt: number) => 'ok' | '429') {
+    const attempts = new Map<string, number>();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const create = mock(async (q: string) => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      try {
+        const n = attempts.get(q) ?? 0;
+        attempts.set(q, n + 1);
+        await new Promise((r) => setTimeout(r, 1));
+        if (behavior(q, n) === '429') throw err429();
+        return { id: `s-${q}`, state: 'Completed' };
+      } finally {
+        inFlight--;
+      }
+    });
+    const slskd = {
+      searches: {
+        create,
+        get: mock(async () => ({ state: 'Completed' })),
+        getResponses: mock(async () => HIT),
+        delete: mock(async () => undefined),
+      },
+    } as unknown as Slskd;
+    return { slskd, get maxInFlight() { return maxInFlight; } };
+  }
+
+  describe('slskd 429 throttling', () => {
+    it('retries a 429 and succeeds — not reported as rate-limited', async () => {
+      // 429 on the first attempt of every query, ok thereafter.
+      const { slskd } = throttledStub((_q, attempt) => (attempt === 0 ? '429' : 'ok'));
+      const hunter = new AlbumHunterService(slskd);
+      const { candidates, rateLimited } = await hunter.hunt('Artist', 'Album', TRACKS);
+      expect(rateLimited).toBe(false);
+      expect(candidates.length).toBeGreaterThan(0);
+    });
+
+    it('reports rateLimited when a query stays 429 after all retries', async () => {
+      // One query (the "Artist - Album" variant) always 429s; the other succeeds.
+      const { slskd } = throttledStub((q) => (q === 'Artist - Album' ? '429' : 'ok'));
+      const hunter = new AlbumHunterService(slskd);
+      const { rateLimited } = await hunter.hunt('Artist', 'Album', TRACKS);
+      expect(rateLimited).toBe(true);
+    });
+
+    it('bounds concurrent search creates (no unbounded Promise.all burst)', async () => {
+      const many = Array.from({ length: 12 }, (_, i) => track(i, `Song ${i}`));
+      const h = throttledStub(() => 'ok');
+      const hunter = new AlbumHunterService(h.slskd);
+      await hunter.hunt('Artist', 'Album', many, { skewSearch: true });
+      // The whole point of the fix: never fire every query at once.
+      expect(h.maxInFlight).toBeLessThanOrEqual(3);
     });
   });
 });
