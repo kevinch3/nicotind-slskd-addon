@@ -14,6 +14,7 @@ import {
   recomputeJobState,
   repointJobItem,
   setItemState,
+  syncItemStatesFromTransfers,
 } from './job-store.js';
 
 describe('addon job store', () => {
@@ -116,5 +117,92 @@ describe('addon job store', () => {
 
   it('derives file item ids from basenames', () => {
     expect(itemIdForFile('a\\b\\Track.MP3')).toBe('f:track.mp3');
+  });
+});
+
+describe('byte progress crosses the poll cursor (#3)', () => {
+  let db: Database;
+
+  beforeEach(() => {
+    db = new Database(':memory:');
+    applySchema(db);
+  });
+
+  function seedDownloading(db: Database, id = 'job-b'): string {
+    createAddonJob(db, {
+      id,
+      intent: 'album',
+      artist: 'Artist',
+      album: 'Album',
+      canonicalTracks: [{ title: 'Song One' }],
+    });
+    addJobItems(db, id, [
+      {
+        itemId: itemIdForTitle('Song One'),
+        title: 'Song One',
+        username: 'peer',
+        filename: 'dir\\01 Song One.mp3',
+        size: 1000,
+      },
+    ]);
+    db.run(`UPDATE addon_job_items SET state = 'downloading' WHERE job_id = ?`, [id]);
+    db.run(`UPDATE addon_jobs SET updated_at = 1 WHERE id = ?`, [id]);
+    return id;
+  }
+
+  const jobUpdatedAt = (db: Database, id: string): number =>
+    (
+      db
+        .query<{ updated_at: number }, [string]>(
+          `SELECT updated_at FROM addon_jobs WHERE id = ?`,
+        )
+        .get(id) ?? { updated_at: 0 }
+    ).updated_at;
+
+  const sync = (db: Database, bytes: number) =>
+    syncItemStatesFromTransfers(db, [
+      {
+        username: 'peer',
+        directories: [
+          {
+            files: [
+              { filename: 'dir\\01 Song One.mp3', state: 'InProgress', bytesTransferred: bytes },
+            ],
+          },
+        ],
+      },
+    ]);
+
+  it('a visible byte advance bumps the job updated_at so the host cursor sees it', () => {
+    const id = seedDownloading(db);
+    sync(db, 400); // 40% of the file — well past the 1% throttle step
+    expect(jobUpdatedAt(db, id)).toBeGreaterThan(1);
+    const item = db
+      .query<{ bytes_transferred: number | null }, [string]>(
+        `SELECT bytes_transferred FROM addon_job_items WHERE job_id = ?`,
+      )
+      .get(id);
+    expect(item?.bytes_transferred).toBe(400);
+  });
+
+  it('a sub-1% advance updates the item but does not spam the job cursor', () => {
+    const id = seedDownloading(db);
+    sync(db, 400);
+    db.run(`UPDATE addon_jobs SET updated_at = 1 WHERE id = ?`, [id]);
+    sync(db, 405); // +0.5% — item tracks it, job stays quiet
+    expect(jobUpdatedAt(db, id)).toBe(1);
+    const item = db
+      .query<{ bytes_transferred: number | null }, [string]>(
+        `SELECT bytes_transferred FROM addon_job_items WHERE job_id = ?`,
+      )
+      .get(id);
+    expect(item?.bytes_transferred).toBe(405);
+  });
+
+  it('a queued→downloading state flip bumps the job regardless of bytes', () => {
+    const id = seedDownloading(db);
+    db.run(`UPDATE addon_job_items SET state = 'queued', bytes_transferred = NULL WHERE job_id = ?`, [id]);
+    sync(db, 0);
+    expect(jobUpdatedAt(db, id)).toBeGreaterThan(1);
   });
 });

@@ -305,6 +305,14 @@ export function syncItemStatesFromTransfers(
   }>,
 ): void {
   const now = Date.now();
+  // Jobs whose progress visibly moved this sync. The host polls
+  // `GET /jobs?since=<cursor>` filtered on the JOB's updated_at, so byte
+  // progress that only touches item rows never crosses the cursor and the
+  // host's card degrades to whole-file counts (kevinch3/NicotinD#805, #3).
+  // Throttled: a bump per state flip or per >=1% advance of the file, not per
+  // poll — steady 40 MB/s progress still lands every tick, but a stalled
+  // transfer stops re-announcing the job.
+  const touched = new Set<string>();
   for (const group of downloads) {
     for (const dir of group.directories) {
       for (const file of dir.files) {
@@ -314,13 +322,33 @@ export function syncItemStatesFromTransfers(
             ? 'queued'
             : null;
         if (!state) continue;
+        const row = db
+          .query<
+            {
+              job_id: string;
+              state: string;
+              size: number | null;
+              bytes_transferred: number | null;
+            },
+            [string, string]
+          >(
+            `SELECT job_id, state, size, bytes_transferred FROM addon_job_items
+             WHERE username = ? AND filename = ? AND state IN ('queued', 'downloading')`,
+          )
+          .get(group.username, file.filename);
+        if (!row) continue;
+        const bytes = file.bytesTransferred ?? null;
         db.run(
           `UPDATE addon_job_items
            SET state = ?, bytes_transferred = ?, updated_at = ?
            WHERE username = ? AND filename = ? AND state IN ('queued', 'downloading')`,
-          [state, file.bytesTransferred ?? null, now, group.username, file.filename],
+          [state, bytes, now, group.username, file.filename],
         );
+        const step = Math.max(1, Math.floor((row.size ?? 0) / 100));
+        const advanced = bytes !== null && bytes - (row.bytes_transferred ?? 0) >= step;
+        if (state !== row.state || advanced) touched.add(row.job_id);
       }
     }
   }
+  for (const jobId of touched) touchJob(db, jobId, now);
 }
