@@ -1,6 +1,6 @@
 import { describe, expect, it, mock } from 'bun:test';
 import type { Slskd } from '@nicotind/slskd-client';
-import { SourceConnection, KICK_THROTTLE_MS } from './source-connection.js';
+import { SourceConnection, KICK_THROTTLE_MS, KICK_GRACE_MS } from './source-connection.js';
 
 function stub(states: Array<Record<string, unknown>>) {
   let i = 0;
@@ -30,11 +30,54 @@ describe('SourceConnection', () => {
     expect(await new SourceConnection({ current: slskd }).isReady()).toBe(false);
   });
 
-  it('kicks slskd out of its reconnect backoff when offline', async () => {
+  it('kicks slskd out of its reconnect backoff once the outage outlasts the grace', async () => {
     // slskd backs off 1→2→…→300s; PUT /server restarts the watchdog, collapsing
-    // a ~25 min hole into seconds. Without this we just wait it out.
+    // the long tail. Without this we just wait it out.
+    let now = 0;
     const { slskd, connect } = stub([OFFLINE]);
-    await new SourceConnection({ current: slskd }).isReady();
+    const conn = new SourceConnection({ current: slskd }, () => now);
+    await conn.isReady();
+    now += KICK_GRACE_MS + 1;
+    await conn.isReady();
+    expect(connect).toHaveBeenCalledTimes(1);
+  });
+
+  // #1046: the server closes on us during searches and then ignores logins —
+  // the shape of a penalty box. Racing slskd's own early backoff could sustain
+  // an outage rather than end it, so the first seconds are left entirely alone.
+  it('never kicks during the early backoff steps slskd handles itself', async () => {
+    let now = 0;
+    const { slskd, connect } = stub([OFFLINE]);
+    const conn = new SourceConnection({ current: slskd }, () => now);
+    for (let i = 0; i < 5; i++) {
+      await conn.isReady();
+      now += KICK_GRACE_MS / 10;
+    }
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it('restarts the grace after the source comes back, so a new outage waits again', async () => {
+    let now = 0;
+    let loggedIn = false;
+    const connect = mock(async () => undefined);
+    const slskd = {
+      server: {
+        getState: async () => ({ state: 'x', isConnected: true, isLoggedIn: loggedIn }),
+        connect,
+      },
+    } as unknown as Slskd;
+    const conn = new SourceConnection({ current: slskd }, () => now);
+    await conn.isReady();
+    now += KICK_GRACE_MS + 1;
+    await conn.isReady();
+    expect(connect).toHaveBeenCalledTimes(1);
+
+    loggedIn = true;
+    await conn.isReady();
+    loggedIn = false;
+    now += KICK_THROTTLE_MS + 1;
+    await conn.isReady();
+    // A fresh outage: the grace applies again even though the throttle expired.
     expect(connect).toHaveBeenCalledTimes(1);
   });
 
@@ -49,6 +92,8 @@ describe('SourceConnection', () => {
     const { slskd, connect } = stub([OFFLINE]);
     const conn = new SourceConnection({ current: slskd }, () => now);
     await conn.isReady();
+    now += KICK_GRACE_MS + 1;
+    await conn.isReady();
     await conn.isReady();
     await conn.isReady();
     expect(connect).toHaveBeenCalledTimes(1);
@@ -58,8 +103,12 @@ describe('SourceConnection', () => {
   });
 
   it('a failing kick never throws — it is best-effort', async () => {
+    let now = 0;
     const { slskd } = stub([OFFLINE]);
     (slskd.server as { connect: unknown }).connect = async () => { throw new Error('nope'); };
-    expect(await new SourceConnection({ current: slskd }).isReady()).toBe(false);
+    const conn = new SourceConnection({ current: slskd }, () => now);
+    await conn.isReady();
+    now += KICK_GRACE_MS + 1;
+    expect(await conn.isReady()).toBe(false);
   });
 });
