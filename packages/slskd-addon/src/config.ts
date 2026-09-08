@@ -1,4 +1,5 @@
 import type { Database } from 'bun:sqlite';
+import { DEFAULT_SEARCH_MIN_INTERVAL_MS } from '@nicotind/slskd-client';
 
 /**
  * Addon configuration: env vars are the deployment floor; host-pushed config
@@ -18,6 +19,8 @@ export interface AddonConfig {
   downloadsDir: string;
   /** Read-only music-dir mount, shared out to the Soulseek network. */
   musicDir: string;
+  /** ms between search submissions; 0 disables pacing (#1046 experiment). */
+  searchMinIntervalMs: number;
 }
 
 const PUSHABLE_KEYS = [
@@ -58,6 +61,13 @@ export function storeConfig(db: Database, pushed: Record<string, unknown>): void
   }
 }
 
+/** Parse the pacing dial, falling back to the default on anything unusable. */
+function intervalFrom(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_SEARCH_MIN_INTERVAL_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_SEARCH_MIN_INTERVAL_MS;
+}
+
 export function resolveConfig(
   db: Database,
   env: Record<string, string | undefined> = process.env,
@@ -72,5 +82,8 @@ export function resolveConfig(
     soulseekPassword: stored.soulseekPassword ?? env.SLSKD_ADDON_SOULSEEK_PASSWORD ?? '',
     downloadsDir: stored.downloadsDir ?? env.SLSKD_ADDON_DOWNLOADS_DIR ?? 'data/downloads',
     musicDir: stored.musicDir ?? env.SLSKD_ADDON_MUSIC_DIR ?? '',
+    // Env-only and not in CONFIG_KEYS on purpose: this is an experiment dial the
+    // operator flips, not a user setting the host pushes over the protocol.
+    searchMinIntervalMs: intervalFrom(env.SLSKD_ADDON_SEARCH_MIN_INTERVAL_MS),
   };
 }

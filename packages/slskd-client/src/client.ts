@@ -20,6 +20,12 @@ export interface SlskdClientOptions {
   baseUrl: string;
   username: string;
   password: string;
+  /**
+   * Minimum gap, in ms, between two `POST /searches` submissions. 0 disables the
+   * pacing entirely. See `SearchesApi` for why this lives at the client rather
+   * than in each caller.
+   */
+  searchMinIntervalMs?: number;
 }
 
 export class SlskdClient {

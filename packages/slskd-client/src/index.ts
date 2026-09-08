@@ -1,5 +1,7 @@
 import { SlskdClient, type SlskdClientOptions } from './client.js';
 export { SlskdRequestError } from './client.js';
+export { MinIntervalGate } from './min-interval-gate.js';
+export { DEFAULT_SEARCH_MIN_INTERVAL_MS } from './api/searches.js';
 export * from './types.js';
 import { SessionApi } from './api/session.js';
 import { SearchesApi } from './api/searches.js';
@@ -25,7 +27,7 @@ export class Slskd {
   constructor(options: SlskdClientOptions) {
     this.client = new SlskdClient(options);
     this.session = new SessionApi(this.client);
-    this.searches = new SearchesApi(this.client);
+    this.searches = new SearchesApi(this.client, options.searchMinIntervalMs);
     this.transfers = new TransfersApi(this.client);
     this.server = new ServerApi(this.client);
     this.options = new OptionsApi(this.client);
