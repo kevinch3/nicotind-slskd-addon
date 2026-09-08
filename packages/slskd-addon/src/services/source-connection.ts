@@ -8,8 +8,30 @@ const log = createLogger('source-connection');
  * every one of them fails while the source is down; without a throttle each
  * would restart slskd's connection watchdog, which is both pointless and a way
  * to keep resetting a handshake that is already in flight.
+ *
+ * Deliberately larger than slskd's own first few backoff steps (1s, 2s, 4s…).
+ * See `KICK_GRACE_MS` for why kicking too eagerly is a hazard and not just waste.
  */
-export const KICK_THROTTLE_MS = 15_000;
+export const KICK_THROTTLE_MS = 60_000;
+
+/**
+ * How long the source must have been offline before we kick at all.
+ *
+ * The kick exists to collapse slskd's 1 → 2 → … → 300s reconnect ladder, which
+ * is what stretches a fault that clears in seconds into a ~25-minute outage.
+ * But #1046 measured that 10 of 13 outages *start* with the Soulseek server
+ * closing our socket during a search, and through an outage every TCP connect
+ * then succeeds while the login times out — the shape of a server-side penalty
+ * box. Whether that penalty is duration-based (extra attempts harmless) or
+ * attempt-based (extra attempts prolong it) is not answerable from logs.
+ *
+ * So the kick waits out the part of the ladder that is cheap anyway, and only
+ * intervenes once slskd's own delay has grown past this. Under either theory
+ * that is safe: we never reconnect more aggressively than slskd already would
+ * in the first half-minute, and we still cut the long tail where the ladder is
+ * sitting at its 300s cap doing nothing.
+ */
+export const KICK_GRACE_MS = 45_000;
 
 /**
  * Is slskd able to reach the Soulseek network *right now*?
@@ -33,6 +55,8 @@ export const KICK_THROTTLE_MS = 15_000;
  */
 export class SourceConnection {
   private lastKickAt = -Infinity;
+  /** When we first saw the source offline in the current outage. */
+  private offlineSince: number | null = null;
 
   /**
    * Takes the same live `slskdRef` the rest of the addon holds rather than a
@@ -60,16 +84,25 @@ export class SourceConnection {
       return false;
     }
 
-    if (state.isLoggedIn) return true;
+    if (state.isLoggedIn) {
+      this.offlineSince = null;
+      return true;
+    }
 
     log.warn({ state: state.state }, 'Soulseek source offline');
     this.kick();
     return false;
   }
 
-  /** Restart slskd's reconnect watchdog. Throttled, best-effort, never throws. */
+  /**
+   * Restart slskd's reconnect watchdog. Throttled, best-effort, never throws,
+   * and held off entirely for the first `KICK_GRACE_MS` of an outage so we can
+   * never out-hammer slskd's own early backoff steps.
+   */
   private kick(): void {
     const at = this.now();
+    if (this.offlineSince === null) this.offlineSince = at;
+    if (at - this.offlineSince < KICK_GRACE_MS) return;
     if (at - this.lastKickAt < KICK_THROTTLE_MS) return;
     this.lastKickAt = at;
     void this.slskdRef.current.server
