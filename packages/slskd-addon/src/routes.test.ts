@@ -26,6 +26,8 @@ const json = (body: unknown) => ({
 function stubSlskd(state: {
   enqueued: Array<{ username: string; files: unknown[] }>;
   downloads: unknown[];
+  /** Flip to make slskd reachable but logged out of Soulseek (#1040). */
+  soulseekOffline: boolean;
 }): Slskd {
   return {
     searches: {
