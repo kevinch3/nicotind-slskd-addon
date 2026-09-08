@@ -35,8 +35,11 @@ describe('MinIntervalGate', () => {
 
   // The whole point: slskd serializes POST /searches behind a SemaphoreSlim(1,1)
   // and 429s anything concurrent, so overlapping creates were never useful.
-  it('serializes — never two in flight at once', async () => {
-    const { gate } = testGate(1000);
+  // Regression: this must hold at interval 0 too. With a spacing interval the
+  // sleeps hide a gate that never actually serializes, which is exactly the bug
+  // the first version of this class shipped with.
+  it('serializes — never two in flight at once, even with no spacing', async () => {
+    const { gate } = testGate(0);
     let inFlight = 0;
     let maxInFlight = 0;
     await Promise.all(

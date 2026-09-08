@@ -33,13 +33,21 @@ export class MinIntervalGate {
   ) {}
 
   async run<T>(fn: () => Promise<T>): Promise<T> {
-    // Chain onto the tail so callers are released in arrival order. The chain
-    // must not inherit a rejection, or one failed call would poison the queue —
-    // hence the caller's own error is re-thrown separately, below.
-    const mine = this.tail.then(() => this.waitTurn());
-    this.tail = mine.catch(() => {});
-    await mine;
-    return fn();
+    // The queued work must include `fn` itself, not just the wait before it.
+    // Chaining only the wait leaves every call free to overlap the moment its
+    // turn arrives — which at interval 0 is immediately, so the gate would
+    // serialize nothing at all.
+    const result = this.tail.then(async () => {
+      await this.waitTurn();
+      return fn();
+    });
+    // The chain must not inherit a rejection, or one failed call would poison
+    // the queue for every caller behind it; `result` still rejects for its own.
+    this.tail = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
   }
 
   private async waitTurn(): Promise<void> {
