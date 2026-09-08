@@ -9,6 +9,7 @@ import {
   singleMatchStrength,
   stripTitleQualifiers,
 } from './album-hunter.service';
+import { SourceConnection, KICK_GRACE_MS } from './source-connection.js';
 
 function track(_id: number, title: string): { title: string } {
   return { title };
@@ -725,9 +726,25 @@ describe('AlbumHunterService', () => {
       expect(res.rateLimited).toBe(false);
     });
 
-    it('kicks slskd out of its reconnect backoff on the way', async () => {
+    // A single hunt does NOT kick: #1046 found outages begin with the server
+    // closing on us and then ignoring logins, so racing slskd's own early
+    // backoff could sustain one. The kick belongs to a sustained outage, which
+    // is the health poll's job, not one user's hunt.
+    it('does not kick during the early backoff a single hunt sits in', async () => {
       const { slskd, connect } = offlineStub(false);
       await new AlbumHunterService(slskd).hunt('Artist', 'Album', TRACKS);
+      expect(connect).not.toHaveBeenCalled();
+    });
+
+    it('kicks once the outage has outlasted the grace', async () => {
+      let now = 0;
+      const { slskd, connect } = offlineStub(false);
+      const source = new SourceConnection({ current: slskd }, () => now);
+      const hunter = new AlbumHunterService(slskd, source);
+      await hunter.hunt('Artist', 'Album', TRACKS);
+      expect(connect).not.toHaveBeenCalled();
+      now += KICK_GRACE_MS + 1;
+      await hunter.hunt('Artist', 'Album', TRACKS);
       expect(connect).toHaveBeenCalled();
     });
 
