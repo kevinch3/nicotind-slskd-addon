@@ -27,6 +27,7 @@ function makeSlskd(): Slskd {
     baseUrl: config.slskdUrl,
     username: config.slskdUsername,
     password: config.slskdPassword,
+    searchMinIntervalMs: config.searchMinIntervalMs,
   });
 }
 
