@@ -685,6 +685,69 @@ describe('AlbumHunterService', () => {
     return { slskd, get maxInFlight() { return maxInFlight; } };
   }
 
+  // #1040. A 409 on POST /searches is slskd saying "I am not logged in to
+  // Soulseek" (SearchesController maps InvalidOperationException -> Conflict).
+  // Reported as an ordinary empty hunt it is indistinguishable from a genuine
+  // miss, so the host concludes "not on Soulseek" and stops trying.
+  describe('source offline (slskd disconnected from Soulseek)', () => {
+    const err409 = () =>
+      new SlskdRequestError('slskd request failed: 409 /searches', 409, '/searches');
+
+    function offlineStub(loggedIn: boolean) {
+      const connect = mock(async () => undefined);
+      const slskd = {
+        server: {
+          getState: mock(async () => ({
+            state: loggedIn ? 'Connected, LoggedIn' : 'Disconnected',
+            isConnected: loggedIn,
+            isLoggedIn: loggedIn,
+          })),
+          connect,
+        },
+        searches: {
+          create: mock(async () => {
+            throw err409();
+          }),
+          get: mock(async () => ({ state: 'Completed' })),
+          getResponses: mock(async () => HIT),
+          delete: mock(async () => undefined),
+        },
+      } as unknown as Slskd;
+      return { slskd, connect };
+    }
+
+    it('reports sourceOffline when a 409 lands and slskd is logged out', async () => {
+      const hunter = new AlbumHunterService(offlineStub(false).slskd);
+      const res = await hunter.hunt('Artist', 'Album', TRACKS);
+      expect(res.sourceOffline).toBe(true);
+      expect(res.candidates).toEqual([]);
+      // An offline hunt is not a rate-limited one; the host reacts differently.
+      expect(res.rateLimited).toBe(false);
+    });
+
+    it('kicks slskd out of its reconnect backoff on the way', async () => {
+      const { slskd, connect } = offlineStub(false);
+      await new AlbumHunterService(slskd).hunt('Artist', 'Album', TRACKS);
+      expect(connect).toHaveBeenCalled();
+    });
+
+    // The authority is slskd's own state endpoint, never the exception text: a
+    // 409 while logged in is some other conflict and must not be laundered into
+    // "the source is down".
+    it('does not claim sourceOffline for a 409 while logged in', async () => {
+      const hunter = new AlbumHunterService(offlineStub(true).slskd);
+      const res = await hunter.hunt('Artist', 'Album', TRACKS);
+      expect(res.sourceOffline).toBe(false);
+    });
+
+    it('a hunt that reaches Soulseek is never sourceOffline', async () => {
+      const { slskd } = throttledStub(() => 'ok');
+      const res = await new AlbumHunterService(slskd).hunt('Artist', 'Album', TRACKS);
+      expect(res.sourceOffline).toBe(false);
+      expect(res.candidates.length).toBeGreaterThan(0);
+    });
+  });
+
   describe('slskd 429 throttling', () => {
     it('retries a 429 and succeeds — not reported as rate-limited', async () => {
       // 429 on the first attempt of every query, ok thereafter.

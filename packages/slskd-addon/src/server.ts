@@ -5,6 +5,7 @@ import { createLogger, type AddonHealth, type AddonStatusRow } from '@nicotind/a
 import { buildManifest } from './manifest.js';
 import { storeConfig } from './config.js';
 import { createProtocolRoutes, type ProtocolRouteDeps } from './routes.js';
+import { SourceConnection } from './services/source-connection.js';
 
 const log = createLogger('slskd-addon');
 
@@ -23,6 +24,8 @@ export interface AddonServerDeps {
    * minimal deployments/tests — the manage/observe surface still works.
    */
   engine?: Pick<ProtocolRouteDeps, 'hunter' | 'trackHunter' | 'downloadsDir'>;
+  /** Shared readiness probe + reconnect kicker; constructed here when absent. */
+  sourceConnection?: SourceConnection;
 }
 
 /**
@@ -33,15 +36,22 @@ export interface AddonServerDeps {
 export function createAddonApp(deps: AddonServerDeps): Hono {
   const app = new Hono();
   const v1 = new Hono();
+  const sourceConnection = deps.sourceConnection ?? new SourceConnection(deps.slskdRef);
 
   v1.get('/manifest', (c) => c.json(buildManifest()));
 
+  // `ready` is "a hunt sent here can succeed", not "the process is up". slskd's
+  // own API stays healthy through a Soulseek outage, so gating on reachability
+  // alone made the host dispatch hunts into a ~25-minute hole and read every
+  // doomed one as an ordinary empty result (#1040). Asking also kicks slskd's
+  // reconnect watchdog, so a host that polls health is what shortens the outage.
   v1.get('/health', async (c) => {
     let ready = false;
     let detail: string | undefined;
     try {
-      await deps.slskdRef.current.server.getState();
-      ready = true;
+      const state = await deps.slskdRef.current.server.getState();
+      ready = await sourceConnection.isReady();
+      if (!ready) detail = `Soulseek source offline (${state.state})`;
     } catch (err) {
       detail = err instanceof Error ? err.message : 'slskd unreachable';
     }

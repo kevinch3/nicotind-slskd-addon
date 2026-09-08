@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Slskd } from '@nicotind/slskd-client';
+import { SlskdRequestError, type Slskd } from '@nicotind/slskd-client';
 import type { AddonAlbumSearchResponse, AddonJob } from '@nicotind/addon-sdk';
 import { applySchema } from './db.js';
 import { createAddonApp } from './server.js';
@@ -26,6 +26,8 @@ const json = (body: unknown) => ({
 function stubSlskd(state: {
   enqueued: Array<{ username: string; files: unknown[] }>;
   downloads: unknown[];
+  /** Flip to make slskd reachable but logged out of Soulseek (#1040). */
+  soulseekOffline: boolean;
 }): Slskd {
   return {
     searches: {
@@ -52,7 +54,14 @@ function stubSlskd(state: {
       getDownloads: async () => state.downloads,
       cancel: async () => {},
     },
-    server: { getState: async () => ({ isConnected: true }) },
+    server: {
+      getState: async () => ({
+        isConnected: true,
+        isLoggedIn: !state.soulseekOffline,
+        state: state.soulseekOffline ? 'Disconnected' : 'Connected, LoggedIn',
+      }),
+      connect: async () => {},
+    },
     users: {
       browseUser: async (username: string) => [
         { directory: `${username}\\Music`, fileCount: 1, files: [] },
@@ -68,6 +77,7 @@ function makeHarness() {
   const state = {
     enqueued: [] as Array<{ username: string; files: unknown[] }>,
     downloads: [] as unknown[],
+    soulseekOffline: false,
   };
   const slskd = stubSlskd(state);
   const slskdRef = { current: slskd };
@@ -107,6 +117,23 @@ describe('addon protocol routes', () => {
     expect(body.candidates[0]!.matchPct).toBe(100);
     expect(body.candidates[0]!.candidateRef).toBeTruthy();
     expect(body.queries.length).toBeGreaterThan(0);
+  });
+
+  // #1040: an offline source must not be reported as an ordinary empty hunt —
+  // the host has to be able to tell "not on Soulseek" from "never asked Soulseek".
+  it('albums/search flags sourceOffline when slskd is logged out of Soulseek', async () => {
+    h.state.soulseekOffline = true;
+    h.slskdRef.current.searches.create = async () => {
+      throw new SlskdRequestError('slskd request failed: 409 /searches', 409, '/searches');
+    };
+    const res = await h.app.request(
+      '/addon/v1/albums/search',
+      json({ artist: 'Artist', album: 'Album', canonicalTracks: [{ title: 'Song One' }] }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as AddonAlbumSearchResponse;
+    expect(body.sourceOffline).toBe(true);
+    expect(body.candidates).toEqual([]);
   });
 
   it('runs the album job loop: candidateRef → enqueue → items → completion → file fetch', async () => {
