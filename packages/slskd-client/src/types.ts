@@ -93,6 +93,13 @@ export interface SlskdServerState {
   state: string;
   username: string;
   isConnected: boolean;
+  /**
+   * Logged in to the Soulseek server. Distinct from `isConnected`: the TCP
+   * connect routinely succeeds and the login handshake then times out, leaving
+   * `Connected, LoggingIn` — a state in which every search and enqueue still
+   * fails. Readiness is this flag, never `isConnected` (#1040).
+   */
+  isLoggedIn?: boolean;
 }
 
 /** Share roll-up as reported by slskd's `/api/v0/application` `shares` block. */

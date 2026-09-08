@@ -5,13 +5,22 @@ import { applySchema } from './db.js';
 import { readStoredConfig, resolveConfig, storeConfig } from './config.js';
 import { createAddonApp } from './server.js';
 
-function stubSlskd(over: { connected?: boolean; throwOnState?: boolean } = {}): Slskd {
+function stubSlskd(
+  over: { connected?: boolean; loggedIn?: boolean; throwOnState?: boolean } = {},
+): Slskd {
   return {
     server: {
       getState: async () => {
         if (over.throwOnState) throw new Error('down');
-        return { isConnected: over.connected ?? true, state: 'Connected', username: 'me' };
+        const loggedIn = over.loggedIn ?? true;
+        return {
+          isConnected: over.connected ?? true,
+          isLoggedIn: loggedIn,
+          state: loggedIn ? 'Connected, LoggedIn' : 'Disconnected',
+          username: 'me',
+        };
       },
+      connect: async () => undefined,
     },
   } as unknown as Slskd;
 }
@@ -71,6 +80,19 @@ describe('addon server (protocol v1 base routes)', () => {
       '/addon/v1/health',
     );
     expect((await down.json()) as object).toMatchObject({ ok: true, ready: false });
+  });
+
+  // #1040: slskd's HTTP API answers happily while its Soulseek session is down.
+  // Reporting `ready` off "the API responded" made the host route hunts to a
+  // source that structurally cannot answer, for ~25 minutes at a time, and every
+  // one of those came back as an ordinary empty result.
+  it('is not ready when slskd is reachable but logged out of Soulseek', async () => {
+    const res = await makeApp({ slskd: stubSlskd({ loggedIn: false }) }).app.request(
+      '/addon/v1/health',
+    );
+    const body = (await res.json()) as { ready: boolean; detail?: string };
+    expect(body.ready).toBe(false);
+    expect(body.detail).toContain('Disconnected');
   });
 
   it('guards status/config behind the bearer token', async () => {

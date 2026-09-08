@@ -147,11 +147,13 @@ export function createProtocolRoutes(deps: ProtocolRouteDeps): Hono {
       const base = await hunter.huntBase(artist, album, canonicalTracks, { skewSearch: true });
       let folderCandidates = base.candidates;
       let rateLimited = base.rateLimited;
+      let sourceOffline = base.sourceOffline;
       const skewRan = skew === true || base.skewNeeded;
       if (skewRan) {
         const full = await hunter.hunt(artist, album, canonicalTracks, { skewSearch: true });
         folderCandidates = full.candidates;
         rateLimited = rateLimited || full.rateLimited;
+        sourceOffline = sourceOffline || full.sourceOffline;
       }
       const queries = [
         ...baseQueries(artist, album),
@@ -165,6 +167,9 @@ export function createProtocolRoutes(deps: ProtocolRouteDeps): Hono {
         // the hunt may be incomplete, so the UI keeps trying rather than reporting
         // a genuine "no results". Omitted when false to keep the wire additive.
         ...(rateLimited ? { rateLimited: true } : {}),
+        // The queries never reached Soulseek — slskd is logged out. Reported so
+        // the host holds the acquire for retry instead of recording a miss.
+        ...(sourceOffline ? { sourceOffline: true } : {}),
       };
       return c.json(body);
     } catch (err) {

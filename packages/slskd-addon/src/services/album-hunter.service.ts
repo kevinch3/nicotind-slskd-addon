@@ -7,6 +7,7 @@ import {
   stripTitleQualifiers,
   titlesOverlap,
 } from '@nicotind/addon-sdk';
+import { SourceConnection } from './source-connection.js';
 
 // Re-export the shared query builders so existing importers (track-pick, tests,
 // callers) keep their `./album-hunter.service` import path — the canonical source
@@ -179,14 +180,23 @@ export interface FolderCandidate {
 }
 
 /**
- * The outcome of a hunt: the scored folder candidates plus whether the search
- * was **rate-limited** by slskd (429s that survived retry). `rateLimited` lets
- * the UI tell "still searching, slskd is throttling us — hang on" apart from a
- * genuine "no results on Soulseek", instead of both looking like an empty hunt.
+ * The outcome of a hunt: the scored folder candidates plus the two reasons an
+ * empty result might not mean "not on Soulseek".
+ *
+ * `rateLimited` — slskd throttled us (429s that survived retry): "still
+ * searching, hang on".
+ *
+ * `sourceOffline` — slskd is not logged in to Soulseek, so the queries never
+ * reached the network at all (#1040). Without this the host reads a structural
+ * outage as a genuine miss and gives up on an album that is perfectly available;
+ * with it the acquire path can hold the work until the source is back.
+ *
+ * Both exist so an empty `candidates` is never silently overloaded.
  */
 export interface HuntResult {
   candidates: FolderCandidate[];
   rateLimited: boolean;
+  sourceOffline: boolean;
 }
 
 // Minimal structural shape of a slskd search response the recognizer needs. A
@@ -324,7 +334,14 @@ export function scoreFolders(
 }
 
 export class AlbumHunterService {
-  constructor(private slskd: Slskd) {}
+  private readonly source: SourceConnection;
+
+  constructor(
+    private slskd: Slskd,
+    source?: SourceConnection,
+  ) {
+    this.source = source ?? new SourceConnection({ current: slskd });
+  }
 
   async hunt(
     artistName: string,
@@ -351,6 +368,7 @@ export class AlbumHunterService {
         return {
           candidates: mergeCandidates(base.candidates, extra.candidates),
           rateLimited: base.rateLimited || extra.rateLimited,
+          sourceOffline: base.sourceOffline || extra.sourceOffline,
         };
       }
     }
@@ -370,16 +388,17 @@ export class AlbumHunterService {
     skewNeeded: boolean;
     responses: ScoreResponse[];
     rateLimited: boolean;
+    sourceOffline: boolean;
   }> {
     const baseQs = baseQueries(artistName, albumTitle);
     // Keep the raw responses (not just the scored candidates): feedback capture
     // snapshots them so a replay fixture can re-run scoreFolders offline —
     // including sub-floor folders the recognizer wrongly dropped.
-    const { responses, rateLimited } = await this.search(baseQs);
+    const { responses, rateLimited, sourceOffline } = await this.search(baseQs);
     const candidates = scoreFolders(canonicalTracks, responses);
     const bestBasePct = candidates.length ? candidates[0].matchPct : 0;
     const skewNeeded = opts.skewSearch !== false && bestBasePct < SKEW_TRIGGER_PCT;
-    return { candidates, skewNeeded, responses, rateLimited };
+    return { candidates, skewNeeded, responses, rateLimited, sourceOffline };
   }
 
   // Phase-2 of a two-phase hunt: run skew-variant queries and return their
@@ -391,7 +410,7 @@ export class AlbumHunterService {
   ): Promise<HuntResult> {
     const baseQs = baseQueries(artistName, albumTitle);
     const skewed = buildSkewedQueries(artistName, albumTitle, baseQs);
-    if (!skewed.length) return { candidates: [], rateLimited: false };
+    if (!skewed.length) return { candidates: [], rateLimited: false, sourceOffline: false };
     return this.searchAndScore(skewed, canonicalTracks);
   }
 
@@ -399,26 +418,38 @@ export class AlbumHunterService {
     queries: string[],
     canonicalTracks: CanonicalTrackRef[],
   ): Promise<HuntResult> {
-    const { responses, rateLimited } = await this.search(queries);
-    return { candidates: scoreFolders(canonicalTracks, responses), rateLimited };
+    const { responses, rateLimited, sourceOffline } = await this.search(queries);
+    return { candidates: scoreFolders(canonicalTracks, responses), rateLimited, sourceOffline };
   }
 
   // Create one search, retrying a 429 (slskd rate-limiting the burst) with
-  // backoff. Returns the search, or null with `rateLimited` telling the caller
-  // whether the null was a rate-limit (retryable — "still searching") or a real
-  // failure (a genuine miss). A non-429 error is not retried.
-  private async createSearch(q: string): Promise<{ search: { id: string } | null; rateLimited: boolean }> {
+  // backoff. Returns the search, or null with the reason: `rateLimited`
+  // (retryable now — "still searching"), `sourceOffline` (slskd is logged out of
+  // Soulseek, retryable only once it is back), or neither, a genuine miss.
+  // A non-429 error is not retried — retrying a 409 in-loop is pointless,
+  // because the outage behind it lasts minutes, not milliseconds.
+  private async createSearch(
+    q: string,
+  ): Promise<{ search: { id: string } | null; rateLimited: boolean; sourceOffline: boolean }> {
     for (let attempt = 0; ; attempt++) {
       try {
-        return { search: await this.slskd.searches.create(q), rateLimited: false };
+        const search = await this.slskd.searches.create(q);
+        return { search, rateLimited: false, sourceOffline: false };
       } catch (err) {
         const is429 = err instanceof SlskdRequestError && err.status === 429;
         if (is429 && attempt < SEARCH_429_MAX_RETRIES) {
           await sleep(SEARCH_429_BACKOFF_MS * (attempt + 1));
           continue;
         }
-        log.warn({ q, err }, 'Search create failed');
-        return { search: null, rateLimited: is429 };
+        // A 409 is slskd refusing the search. Ask slskd's own state endpoint
+        // whether that is because it is logged out, rather than reading the
+        // exception text — the status alone does not say which conflict it is,
+        // and a message string from a third party is not an interface. The
+        // check also kicks the reconnect watchdog (throttled).
+        const is409 = err instanceof SlskdRequestError && err.status === 409;
+        const sourceOffline = is409 ? !(await this.source.isReady()) : false;
+        log.warn({ q, err, sourceOffline }, 'Search create failed');
+        return { search: null, rateLimited: is429, sourceOffline };
       }
     }
   }
@@ -428,16 +459,24 @@ export class AlbumHunterService {
   // whether any query stayed rate-limited after retries. Kept separate from
   // `scoreFolders` (the pure recognizer) so a hunt can surface its raw responses
   // for feedback capture without re-running the network.
-  private async search(queries: string[]): Promise<{ responses: ScoreResponse[]; rateLimited: boolean }> {
+  private async search(
+    queries: string[],
+  ): Promise<{ responses: ScoreResponse[]; rateLimited: boolean; sourceOffline: boolean }> {
     const created = await mapPool(queries, SEARCH_CREATE_CONCURRENCY, (q) => this.createSearch(q));
     const searchIds = created.map((c) => c.search?.id).filter((id): id is string => Boolean(id));
     // Rate-limited only if a query was dropped to a 429 *and* we didn't otherwise
     // get results — an incomplete hunt the user can retry, not a genuine miss.
     const rateLimited = created.some((c) => c.rateLimited) && searchIds.length < queries.length;
-    if (!searchIds.length) return { responses: [], rateLimited: created.some((c) => c.rateLimited) };
+    // Any query dropped because the source was offline makes the whole hunt an
+    // untrustworthy miss: the surviving queries searched a network the dropped
+    // ones never reached, so an empty (or thin) result says nothing.
+    const sourceOffline = created.some((c) => c.sourceOffline);
+    if (!searchIds.length) {
+      return { responses: [], rateLimited: created.some((c) => c.rateLimited), sourceOffline };
+    }
 
     try {
-      return { responses: await this.pollUntilDone(searchIds), rateLimited };
+      return { responses: await this.pollUntilDone(searchIds), rateLimited, sourceOffline };
     } finally {
       // Clean up searches (bounded — the same burst that 429s creates also 429s
       // deletes, and leaked searches pile up in slskd's history).
