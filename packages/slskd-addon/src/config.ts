@@ -27,6 +27,12 @@ export interface AddonConfig {
    * first production cycle can be read before anything is unlinked.
    */
   downloadRetentionDays: number;
+  /**
+   * Report what the retention sweep would delete without deleting it. The
+   * intended first production cycle: once a file is unlinked it is gone, so the
+   * safety margin lives in reading this log, not in review.
+   */
+  downloadRetentionDryRun: boolean;
 }
 
 const PUSHABLE_KEYS = [
@@ -103,5 +109,6 @@ export function resolveConfig(
     // operator flips, not a user setting the host pushes over the protocol.
     searchMinIntervalMs: intervalFrom(env.SLSKD_ADDON_SEARCH_MIN_INTERVAL_MS),
     downloadRetentionDays: daysFrom(env.SLSKD_ADDON_DOWNLOAD_RETENTION_DAYS),
+    downloadRetentionDryRun: env.SLSKD_ADDON_DOWNLOAD_RETENTION_DRY_RUN === 'true',
   };
 }

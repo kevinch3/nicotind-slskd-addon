@@ -60,6 +60,7 @@ const retention = new DownloadRetentionService(slskdRef.current, {
   db,
   downloadsDir: () => config.downloadsDir,
   retentionDays: () => config.downloadRetentionDays,
+  dryRun: config.downloadRetentionDryRun,
 });
 retention.start();
 

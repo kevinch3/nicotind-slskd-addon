@@ -188,6 +188,44 @@ describe('DownloadRetentionService (#1052)', () => {
     expect(db.query(`SELECT * FROM completed_downloads`).all()).toHaveLength(1);
   });
 
+  it('a dry run writes nothing at all, not even the dead-row cleanup', async () => {
+    const db = makeDb();
+    const root = makeRoot();
+    db.run(
+      `INSERT INTO completed_downloads
+         (transfer_key, username, directory, filename, relative_path, basename, completed_at)
+       VALUES ('k','peer','d','f.flac', NULL, 'f.flac', ?)`,
+      [Date.now() - 30 * DAY],
+    );
+
+    await service(db, root, { dryRun: true }).sweep();
+
+    // A dry run that writes is not a dry run.
+    expect(db.query(`SELECT * FROM completed_downloads`).all()).toHaveLength(1);
+  });
+
+  it('does not report a reclaim for a ledger row whose file is already gone', async () => {
+    const db = makeDb();
+    const root = makeRoot();
+    // A row pointing at a path that does not exist: bookkeeping, not bytes.
+    db.run(
+      `INSERT INTO completed_downloads
+         (transfer_key, username, directory, filename, relative_path, basename, completed_at)
+       VALUES ('k','peer','d','gone.flac','Album/gone.flac','gone.flac', ?)`,
+      [Date.now() - 30 * DAY],
+    );
+
+    const dry = await service(db, root, { dryRun: true }).sweep();
+    expect(dry.removed).toBe(0);
+    expect(db.query(`SELECT * FROM completed_downloads`).all()).toHaveLength(1);
+
+    // Applying still reaps the row — it just was never a byte reclaim.
+    const res = await service(db, root).sweep();
+    expect(res.removed).toBe(0);
+    expect(res.bytes).toBe(0);
+    expect(db.query(`SELECT * FROM completed_downloads`).all()).toHaveLength(0);
+  });
+
   it('drops a dead ledger row that never resolved a path, without unlinking anything', async () => {
     const db = makeDb();
     const root = makeRoot();

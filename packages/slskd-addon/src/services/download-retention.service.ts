@@ -1,4 +1,4 @@
-import { readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import type { Database } from 'bun:sqlite';
 import { createLogger } from '@nicotind/addon-sdk';
@@ -113,6 +113,13 @@ export class DownloadRetentionService {
         };
         if (active.has(leafOf(row.relative_path))) continue;
         const age = Math.round((Date.now() - row.completed_at) / 86_400_000);
+        // A row whose file is already gone is bookkeeping, not a reclaim. Saying
+        // "would release" for it inflates the dry-run report that is supposed to
+        // be the safety check, so account for it separately.
+        if (!existsSync(file.absPath)) {
+          if (!this.dryRun) removeDownload(this.db, root, file, 'ledger row outlived its file');
+          continue;
+        }
         if (this.dryRun) {
           log.info({ path: row.relative_path, ageDays: age }, 'retention (dry run): would release');
           continue;
@@ -160,9 +167,13 @@ export class DownloadRetentionService {
 
       // 3. Ledger rows whose path never resolved. These hold no bytes, so they
       // are never an unlink — just dead rows that would otherwise accumulate.
-      this.db.run(`DELETE FROM completed_downloads WHERE relative_path IS NULL AND completed_at < ?`, [
-        cutoff,
-      ]);
+      // Skipped under dryRun: a dry run that writes is not a dry run.
+      if (!this.dryRun) {
+        this.db.run(
+          `DELETE FROM completed_downloads WHERE relative_path IS NULL AND completed_at < ?`,
+          [cutoff],
+        );
+      }
 
       if (removed > 0) {
         log.info({ removed, bytes, days }, 'retention sweep reclaimed downloaded files');
