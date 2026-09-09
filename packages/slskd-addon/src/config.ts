@@ -21,6 +21,12 @@ export interface AddonConfig {
   musicDir: string;
   /** ms between search submissions; 0 disables pacing (#1046 experiment). */
   searchMinIntervalMs: number;
+  /**
+   * Days an unreferenced downloaded file may sit before the retention sweep
+   * reclaims it; `0` disables the sweep (NicotinD#1052). Ships disabled so the
+   * first production cycle can be read before anything is unlinked.
+   */
+  downloadRetentionDays: number;
 }
 
 const PUSHABLE_KEYS = [
@@ -68,6 +74,17 @@ function intervalFrom(raw: string | undefined): number {
   return Number.isFinite(n) && n >= 0 ? n : DEFAULT_SEARCH_MIN_INTERVAL_MS;
 }
 
+/**
+ * Parse the retention window. Unset or unusable means **disabled**, not the
+ * suggested default: a sweep that deletes files must be switched on by someone
+ * who meant to, never by a typo in an env var.
+ */
+function daysFrom(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return 0;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
 export function resolveConfig(
   db: Database,
   env: Record<string, string | undefined> = process.env,
@@ -85,5 +102,6 @@ export function resolveConfig(
     // Env-only and not in CONFIG_KEYS on purpose: this is an experiment dial the
     // operator flips, not a user setting the host pushes over the protocol.
     searchMinIntervalMs: intervalFrom(env.SLSKD_ADDON_SEARCH_MIN_INTERVAL_MS),
+    downloadRetentionDays: daysFrom(env.SLSKD_ADDON_DOWNLOAD_RETENTION_DAYS),
   };
 }

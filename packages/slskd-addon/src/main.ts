@@ -7,6 +7,7 @@ import { AlbumHunterService } from './services/album-hunter.service.js';
 import { TrackHunterService } from './services/track-hunter.service.js';
 import { AlbumFallbackService } from './services/album-fallback.service.js';
 import { SearchLanes } from './services/search-lanes.js';
+import { DownloadRetentionService } from './services/download-retention.service.js';
 import { DownloadRetryService } from './services/download-retry.service.js';
 import { makeAddonFallbackHost } from './services/addon-fallback-host.js';
 import { TransferPoller } from './services/transfer-poller.js';
@@ -51,6 +52,16 @@ const retry = new DownloadRetryService(slskdRef.current, {
   onSweep: () => fallback.sweep(),
 });
 retry.start();
+
+// The backstop for files no job release ever frees (NicotinD#1052). Reads its
+// window live so a pushed config change takes effect without a restart, and
+// stays inert until an operator sets one.
+const retention = new DownloadRetentionService(slskdRef.current, {
+  db,
+  downloadsDir: () => config.downloadsDir,
+  retentionDays: () => config.downloadRetentionDays,
+});
+retention.start();
 
 // Completion tracking: resolve finished transfers to files under downloadsDir
 // and mark the owning job items file-ready for GET jobs/:id/files/:itemId.

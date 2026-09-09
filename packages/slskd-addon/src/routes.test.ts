@@ -1,6 +1,6 @@
-import { describe, expect, it, beforeEach } from 'bun:test';
+import { describe, expect, it, afterEach, beforeEach } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SlskdRequestError, type Slskd } from '@nicotind/slskd-client';
@@ -71,6 +71,9 @@ function stubSlskd(state: {
   } as unknown as Slskd;
 }
 
+/** Temp download dirs to remove after each test — these hold real files. */
+const tempDirs: string[] = [];
+
 function makeHarness() {
   const db = new Database(':memory:');
   applySchema(db);
@@ -82,6 +85,7 @@ function makeHarness() {
   const slskd = stubSlskd(state);
   const slskdRef = { current: slskd };
   const downloadsDir = mkdtempSync(join(tmpdir(), 'addon-dl-'));
+  tempDirs.push(downloadsDir);
   const app = createAddonApp({
     db,
     slskdRef,
@@ -100,6 +104,10 @@ describe('addon protocol routes', () => {
 
   beforeEach(() => {
     h = makeHarness();
+  });
+
+  afterEach(() => {
+    for (const d of tempDirs.splice(0)) rmSync(d, { recursive: true, force: true });
   });
 
   it('albums/search returns ranked candidates with refs + queries', async () => {
@@ -258,6 +266,87 @@ describe('addon protocol routes', () => {
     expect(file.status).toBe(200);
     expect(await file.text()).toBe('audio-bytes');
     expect(file.headers.get('etag')).toBeTruthy();
+  });
+
+  /**
+   * #1052: the host deleting a job is what frees its bytes. Until this landed,
+   * `DELETE /jobs/:id` dropped the ledger rows and left the files — 34 GB on
+   * kpc, growing every day.
+   */
+  it('deleting a job releases its files from disk', async () => {
+    const abs = join(h.downloadsDir, 'Album', '01 Song One.mp3');
+    mkdirSync(join(h.downloadsDir, 'Album'), { recursive: true });
+    writeFileSync(abs, 'audio-bytes');
+    h.db.run(
+      `INSERT INTO addon_jobs (id, intent, state, created_at, updated_at)
+       VALUES ('j1','album','done',1,1)`,
+    );
+    h.db.run(
+      `INSERT INTO addon_job_items (job_id, item_id, username, filename, state, file_ready, updated_at)
+       VALUES ('j1','t:one','goodpeer','Music\\Album\\01 Song One.mp3','completed',1,1)`,
+    );
+    h.db.run(
+      `INSERT INTO completed_downloads
+         (transfer_key, username, directory, filename, relative_path, basename, completed_at)
+       VALUES ('k','goodpeer','Music\\Album','Music\\Album\\01 Song One.mp3','Album/01 Song One.mp3','01 song one.mp3',1)`,
+    );
+
+    const res = await h.app.request('/addon/v1/jobs/j1', { method: 'DELETE', headers: AUTH });
+    expect(res.status).toBe(200);
+    expect(existsSync(abs)).toBe(false);
+    // The emptied folder goes too, but never the downloads root itself.
+    expect(existsSync(join(h.downloadsDir, 'Album'))).toBe(false);
+    expect(existsSync(h.downloadsDir)).toBe(true);
+    expect(h.db.query(`SELECT * FROM completed_downloads`).all()).toHaveLength(0);
+  });
+
+  /**
+   * One completed transfer satisfies items across jobs — `markItemsCompletedByTransfer`
+   * matches on (username, filename) with no job filter — so releasing one job
+   * must not pull the file out from under another that still wants it.
+   */
+  it('keeps a released job\'s file when another live job still names it', async () => {
+    const abs = join(h.downloadsDir, 'Album', '01 Song One.mp3');
+    mkdirSync(join(h.downloadsDir, 'Album'), { recursive: true });
+    writeFileSync(abs, 'audio-bytes');
+    for (const [id, state] of [
+      ['j1', 'done'],
+      ['j2', 'active'],
+    ]) {
+      h.db.run(
+        `INSERT INTO addon_jobs (id, intent, state, created_at, updated_at) VALUES (?,'album',?,1,1)`,
+        [id, state],
+      );
+      h.db.run(
+        `INSERT INTO addon_job_items (job_id, item_id, username, filename, state, file_ready, updated_at)
+         VALUES (?,'t:one','goodpeer','Music\\Album\\01 Song One.mp3','completed',1,1)`,
+        [id],
+      );
+    }
+    h.db.run(
+      `INSERT INTO completed_downloads
+         (transfer_key, username, directory, filename, relative_path, basename, completed_at)
+       VALUES ('k','goodpeer','Music\\Album','Music\\Album\\01 Song One.mp3','Album/01 Song One.mp3','01 song one.mp3',1)`,
+    );
+
+    const res = await h.app.request('/addon/v1/jobs/j1', { method: 'DELETE', headers: AUTH });
+    expect(res.status).toBe(200);
+    expect(existsSync(abs)).toBe(true);
+  });
+
+  it('deleting a job whose file is already gone still succeeds', async () => {
+    h.db.run(
+      `INSERT INTO addon_jobs (id, intent, state, created_at, updated_at)
+       VALUES ('j1','album','done',1,1)`,
+    );
+    h.db.run(
+      `INSERT INTO addon_job_items (job_id, item_id, username, filename, state, file_ready, updated_at)
+       VALUES ('j1','t:one','goodpeer','missing.mp3','completed',1,1)`,
+    );
+
+    const res = await h.app.request('/addon/v1/jobs/j1', { method: 'DELETE', headers: AUTH });
+    expect(res.status).toBe(200);
+    expect(h.db.query(`SELECT * FROM addon_jobs`).all()).toHaveLength(0);
   });
 
   it('search returns song + folder rows', async () => {

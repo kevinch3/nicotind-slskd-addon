@@ -11,6 +11,7 @@ import {
   type AddonSearchResult,
 } from '@nicotind/addon-sdk';
 import type { Slskd } from '@nicotind/slskd-client';
+import { releaseJobFiles, resolveItemFile } from './services/download-files.js';
 import type { AlbumHunterService } from './services/album-hunter.service.js';
 import type { TrackHunterService } from './services/track-hunter.service.js';
 import {
@@ -259,9 +260,17 @@ export function createProtocolRoutes(deps: ProtocolRouteDeps): Hono {
     return c.json({ job: getAddonJob(deps.db, job.id) });
   });
 
+  // Deleting a job is the host saying it is done with these bytes, so this is
+  // where they go (NicotinD#1052). Core only releases a job once every item it
+  // wanted is durably in the library, or when a person discarded the job — and
+  // until this landed the addon kept every file it ever downloaded.
   app.delete('/jobs/:id', (c) => {
     const job = getAddonJob(deps.db, c.req.param('id'));
     if (!job) return c.json({ error: 'job not found' }, 404);
+    const freed = releaseJobFiles(deps.db, deps.downloadsDir(), job.id);
+    if (freed.removed > 0) {
+      log.info({ jobId: job.id, ...freed }, 'released the files of a deleted job');
+    }
     deleteAddonJob(deps.db, job.id);
     return c.json({ ok: true });
   });
@@ -271,13 +280,9 @@ export function createProtocolRoutes(deps: ProtocolRouteDeps): Hono {
     const item = job?.items.find((i) => i.itemId === c.req.param('itemId'));
     if (!job || !item) return c.json({ error: 'item not found' }, 404);
     if (!item.fileReady) return c.json({ error: 'file not ready' }, 409);
-    const row = deps.db
-      .query<{ relative_path: string | null }, [string, string]>(
-        `SELECT relative_path FROM completed_downloads WHERE username = ? AND filename = ?`,
-      )
-      .get(item.username, item.filename);
-    if (!row?.relative_path) return c.json({ error: 'file not resolved on disk' }, 409);
-    const abs = join(deps.downloadsDir(), row.relative_path);
+    const file = resolveItemFile(deps.db, deps.downloadsDir(), item);
+    if (!file) return c.json({ error: 'file not resolved on disk' }, 409);
+    const abs = file.absPath;
     if (!existsSync(abs)) return c.json({ error: 'file missing on disk' }, 410);
     const stat = statSync(abs);
     return new Response(Bun.file(abs), {
