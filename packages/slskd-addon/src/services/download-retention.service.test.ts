@@ -178,12 +178,20 @@ describe('DownloadRetentionService (#1052)', () => {
     expect(existsSync(abs)).toBe(true);
   });
 
-  it('a dry run reports without deleting', async () => {
+  /**
+   * The count must come back from `sweep()`, not only from per-file logging: a
+   * buffered logger drops lines at process exit, so a dry run whose only output
+   * is a log is not a safety check you can rely on.
+   */
+  it('a dry run reports what it would take, and deletes nothing', async () => {
     const db = makeDb();
     const root = makeRoot();
     const abs = land(db, root, { relPath: 'Album/01 One.flac', ageDays: 9 });
 
-    expect((await service(db, root, { dryRun: true }).sweep()).removed).toBe(0);
+    const res = await service(db, root, { dryRun: true }).sweep();
+
+    expect(res.removed).toBe(1);
+    expect(res.bytes).toBeGreaterThan(0);
     expect(existsSync(abs)).toBe(true);
     expect(db.query(`SELECT * FROM completed_downloads`).all()).toHaveLength(1);
   });
