@@ -122,6 +122,12 @@ export class DownloadRetentionService {
         }
         if (this.dryRun) {
           log.info({ path: row.relative_path, ageDays: age }, 'retention (dry run): would release');
+          removed += 1;
+          try {
+            bytes += statSync(file.absPath).size;
+          } catch {
+            /* raced with something else; the count is a report, not a ledger */
+          }
           continue;
         }
         bytes += removeDownload(this.db, root, file, `unreferenced for ${age}d`);
@@ -154,6 +160,8 @@ export class DownloadRetentionService {
         if (mtime >= cutoff) continue;
         if (this.dryRun) {
           log.info({ path: rel, bytes: size }, 'retention (dry run): would release (no ledger row)');
+          removed += 1;
+          bytes += size;
           continue;
         }
         bytes += removeDownload(
@@ -175,8 +183,14 @@ export class DownloadRetentionService {
         );
       }
 
+      // Always summarise: a dry run whose only output is per-file logging is not
+      // a usable safety check, because a buffered logger can drop those lines at
+      // exit. The returned counts are the reliable answer.
       if (removed > 0) {
-        log.info({ removed, bytes, days }, 'retention sweep reclaimed downloaded files');
+        log.info(
+          { removed, bytes, days, dryRun: this.dryRun },
+          this.dryRun ? 'retention sweep (dry run) would reclaim' : 'retention sweep reclaimed downloaded files',
+        );
       }
       return { removed, bytes };
     } finally {
