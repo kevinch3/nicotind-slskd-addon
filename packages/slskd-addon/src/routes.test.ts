@@ -130,6 +130,30 @@ describe('addon protocol routes', () => {
     expect(body.searchesAnswered).toBe(body.searchesFired);
   });
 
+  // The route used to pass `skewSearch: undefined`, which the hunter read as
+  // "no skew" — so a hunt whose base missed never fired a skew wave on prod.
+  it('albums/search runs the skew waves when the base pair misses', async () => {
+    const fired: string[] = [];
+    h.slskdRef.current.searches.create = async (q: string) => {
+      fired.push(q);
+      return { id: `s-${q}`, state: 'Completed' } as never;
+    };
+    h.slskdRef.current.searches.getResponses = (async (id: string) =>
+      id === 's-Album Artist'
+        ? [{ username: 'skewpeer', freeUploadSlots: 1, queueLength: 0, uploadSpeed: 100,
+             files: [{ filename: 'Music\\Album\\01 Song One.mp3', size: 1000 }, { filename: 'Music\\Album\\02 Song Two.mp3', size: 2000 }] }]
+        : []) as never;
+    const res = await h.app.request(
+      '/addon/v1/albums/search',
+      json({ artist: 'Artist', album: 'Album', canonicalTracks: [{ title: 'Song One' }, { title: 'Song Two' }] }),
+    );
+    const body = (await res.json()) as AddonAlbumSearchResponse;
+    expect(fired).toEqual(['Artist Album', 'Artist - Album', 'Album Artist', 'Album']);
+    expect(body.skewNeeded).toBe(true);
+    expect(body.candidates[0]!.matchPct).toBe(100);
+    expect(body.searchesFired).toBe(4);
+  });
+
   // #1040: an offline source must not be reported as an ordinary empty hunt —
   // the host has to be able to tell "not on Soulseek" from "never asked Soulseek".
   it('albums/search flags sourceOffline when slskd is logged out of Soulseek', async () => {

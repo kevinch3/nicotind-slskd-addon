@@ -147,7 +147,8 @@ export function createProtocolRoutes(deps: ProtocolRouteDeps): Hono {
       // is never re-run for the skew phase — it used to be, doubling the lane
       // time of every hunt that needed skew (#1049).
       const res = await hunter.hunt(artist, album, canonicalTracks, {
-        skewSearch: skew === true || undefined,
+        skewSearch: true,
+        forceSkew: skew === true,
       });
       const body: AddonAlbumSearchResponse = {
         candidates: candidates.put(res.candidates),
