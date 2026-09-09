@@ -119,6 +119,17 @@ describe('addon protocol routes', () => {
     expect(body.queries.length).toBeGreaterThan(0);
   });
 
+  // #1049: the host needs to tell a hunt the source cut short from a genuine miss.
+  it('albums/search reports how many searches were fired and answered', async () => {
+    const res = await h.app.request(
+      '/addon/v1/albums/search',
+      json({ artist: 'Artist', album: 'Album', canonicalTracks: [{ title: 'Song One' }, { title: 'Song Two' }] }),
+    );
+    const body = (await res.json()) as AddonAlbumSearchResponse;
+    expect(body.searchesFired).toBe(body.queries.length);
+    expect(body.searchesAnswered).toBe(body.searchesFired);
+  });
+
   // #1040: an offline source must not be reported as an ordinary empty hunt —
   // the host has to be able to tell "not on Soulseek" from "never asked Soulseek".
   it('albums/search flags sourceOffline when slskd is logged out of Soulseek', async () => {

@@ -8,6 +8,7 @@ import {
   titlesOverlap,
 } from '@nicotind/addon-sdk';
 import { SourceConnection } from './source-connection.js';
+import { SearchLanes } from './search-lanes.js';
 
 // Re-export the shared query builders so existing importers (track-pick, tests,
 // callers) keep their `./album-hunter.service` import path — the canonical source
@@ -40,18 +41,32 @@ const AUDIO_EXTENSIONS = new Set([
 ]);
 
 const POLL_INTERVAL_MS = 2_000;
-// 45s (was 30s): Soulseek peers — especially the slow/queued ones common for
-// Latin-American material — often only respond late in the window; cutting off
-// at 30s dropped otherwise-complete folders before they could be scored.
-const HUNT_TIMEOUT_MS = 45_000;
 
-// Search-create throttle (#hunt-429). slskd rate-limits POST /searches and
-// returns 429 for a burst — firing every base+skew query at once (the old
-// unbounded Promise.all) tripped it, silently dropping queries so a hunt for a
-// less-seeded album could find nothing. Cap concurrent creates and retry a 429
-// with backoff; only a query still 429ing after all retries counts as
-// rate-limited (surfaced to the user as "still searching", vs a genuine miss).
-const SEARCH_CREATE_CONCURRENCY = 3;
+// The source's search concurrency (NicotinD#1049). slskd's Soulseek.NET client
+// runs `maximumConcurrentSearches = 2` and slskd never overrides it: every
+// further search waits in `Queued`. A hunt therefore fires its queries in waves
+// of exactly this many, so one hunt never queues behind itself.
+export const SEARCH_LANES = 2;
+
+// Per-search inactivity timeout handed to slskd. Soulseek.NET's default is 15 s
+// after the last response, but responses plateau by ~10 s: measured on prod
+// (three query pairs, both arms) 8 s returned the identical response counts
+// while cutting the lane hold from up to 37.6 s to 12.0 s.
+export const SEARCH_TIMEOUT_MS = 8_000;
+
+// Ceiling for one wave: creation + the responses + the inactivity timeout, with
+// headroom for slow peers. A wave normally ends well before this because slskd
+// reports the searches complete.
+export const WAVE_TIMEOUT_MS = 30_000;
+
+// Skew variants are ranked most-precise first; the tail (title-only, broad) is
+// the least likely to add a folder the earlier ones missed and would cost a
+// whole extra lane cycle, so a hunt stops at this many.
+export const MAX_SKEW_QUERIES = 4;
+
+// 429 retry (#hunt-429): creates are serialized by the client, but a 429 can
+// still surface when another process posts a search; only a query still 429ing
+// after all retries counts as rate-limited ("still searching", vs a genuine miss).
 const SEARCH_429_MAX_RETRIES = 3;
 const SEARCH_429_BACKOFF_MS = 500;
 
@@ -195,6 +210,18 @@ export interface FolderCandidate {
  */
 export interface HuntResult {
   candidates: FolderCandidate[];
+  /** No base candidate was confidently complete, so skew variants were (or would be) worth firing. */
+  skewNeeded: boolean;
+  /** The literal queries this hunt actually submitted, in order. */
+  queries: string[];
+  /**
+   * Searches submitted vs searches that ran to completion inside the deadline.
+   * `searchesAnswered < searchesFired` means the source was busy (#1049): its
+   * two lanes were held by something else and our searches sat queued. An
+   * empty result is then not evidence about the album.
+   */
+  searchesFired: number;
+  searchesAnswered: number;
   rateLimited: boolean;
   sourceOffline: boolean;
 }
@@ -212,7 +239,7 @@ export interface ScoreResponse {
 
 // The pure, IO-free recognizer core: group raw slskd responses into folders,
 // score each against the canonical tracklist, rank best-first, cap at 20. why:
-// extracted out of `searchAndScore` (which owns the network I/O) so a captured
+// extracted out of the wave I/O (`wave`, which owns the network) so a captured
 // feedback fixture — canonical tracklist + raw responses — can replay the exact
 // ranking offline in a test and assert the human-correct folder ranks #1.
 export function scoreFolders(
@@ -335,45 +362,69 @@ export function scoreFolders(
 
 export class AlbumHunterService {
   private readonly source: SourceConnection;
+  private readonly lanes: SearchLanes;
+  private readonly waveTimeoutMs: number;
+  private readonly pollIntervalMs: number;
 
   constructor(
     private slskd: Slskd,
     source?: SourceConnection,
+    lanes?: SearchLanes,
+    timing: { waveTimeoutMs?: number; pollIntervalMs?: number } = {},
   ) {
     this.source = source ?? new SourceConnection({ current: slskd });
+    this.lanes = lanes ?? new SearchLanes();
+    this.waveTimeoutMs = timing.waveTimeoutMs ?? WAVE_TIMEOUT_MS;
+    this.pollIntervalMs = timing.pollIntervalMs ?? POLL_INTERVAL_MS;
   }
 
+  /**
+   * One hunt = one lane session: the base pair first, then — only while no
+   * candidate is confidently complete — the skew variants two at a time, most
+   * precise first. Each wave fits the source's two lanes exactly, so a hunt never
+   * queues behind itself, and a strong early wave adds no further searches.
+   */
   async hunt(
     artistName: string,
     albumTitle: string,
     canonicalTracks: CanonicalTrackRef[],
     opts: { skewSearch?: boolean } = {},
   ): Promise<HuntResult> {
-    const baseQs = baseQueries(artistName, albumTitle);
+    return this.lanes.run('user', async () => {
+      const baseQs = baseQueries(artistName, albumTitle);
+      const base = await this.wave(baseQs);
+      let candidates = scoreFolders(canonicalTracks, base.responses);
+      const bestBasePct = candidates.length ? candidates[0].matchPct : 0;
+      const skewNeeded = opts.skewSearch !== false && bestBasePct < SKEW_TRIGGER_PCT;
+      const acc: HuntResult = {
+        candidates,
+        skewNeeded,
+        queries: [...baseQs],
+        searchesFired: base.fired,
+        searchesAnswered: base.answered,
+        rateLimited: base.rateLimited,
+        sourceOffline: base.sourceOffline,
+      };
+      if (!opts.skewSearch || !skewNeeded) return acc;
 
-    const base = await this.searchAndScore(baseQs, canonicalTracks);
-
-    // Soft-ban bypass: slskd/Soulseek silently returns zero responses for some
-    // exact phrases (e.g. "The Artist - The Track") even when the files exist.
-    // When the user opts in, also run textually-skewed variants of the query and
-    // merge the results — not only when the base is empty, but whenever no base
-    // candidate is confidently complete (best match < SKEW_TRIGGER_PCT). A junk
-    // partial folder would otherwise keep the base non-empty and hide a complete
-    // folder reachable only via a skewed phrase. A strong base adds no searches.
-    const bestBasePct = base.candidates.length ? base.candidates[0].matchPct : 0;
-    if (opts.skewSearch && bestBasePct < SKEW_TRIGGER_PCT) {
-      const skewed = buildSkewedQueries(artistName, albumTitle, baseQs);
-      if (skewed.length) {
-        const extra = await this.searchAndScore(skewed, canonicalTracks);
-        return {
-          candidates: mergeCandidates(base.candidates, extra.candidates),
-          rateLimited: base.rateLimited || extra.rateLimited,
-          sourceOffline: base.sourceOffline || extra.sourceOffline,
-        };
+      const skewed = buildSkewedQueries(artistName, albumTitle, baseQs).slice(0, MAX_SKEW_QUERIES);
+      for (let i = 0; i < skewed.length; i += SEARCH_LANES) {
+        // Stop once a wave found a confident folder, or the source is offline —
+        // the remaining variants would only hold the lanes for nothing.
+        const bestPct = candidates.length ? candidates[0].matchPct : 0;
+        if (bestPct >= SKEW_TRIGGER_PCT || acc.sourceOffline) break;
+        const chunk = skewed.slice(i, i + SEARCH_LANES);
+        const w = await this.wave(chunk);
+        candidates = mergeCandidates(candidates, scoreFolders(canonicalTracks, w.responses));
+        acc.candidates = candidates;
+        acc.queries.push(...chunk);
+        acc.searchesFired += w.fired;
+        acc.searchesAnswered += w.answered;
+        acc.rateLimited = acc.rateLimited || w.rateLimited;
+        acc.sourceOffline = acc.sourceOffline || w.sourceOffline;
       }
-    }
-
-    return base;
+      return acc;
+    });
   }
 
   // Phase-1 of a two-phase hunt: run base queries only and report whether skew
@@ -383,57 +434,74 @@ export class AlbumHunterService {
     albumTitle: string,
     canonicalTracks: CanonicalTrackRef[],
     opts: { skewSearch?: boolean } = {},
-  ): Promise<{
-    candidates: FolderCandidate[];
-    skewNeeded: boolean;
-    responses: ScoreResponse[];
-    rateLimited: boolean;
-    sourceOffline: boolean;
-  }> {
+  ): Promise<HuntResult & { responses: ScoreResponse[] }> {
     const baseQs = baseQueries(artistName, albumTitle);
     // Keep the raw responses (not just the scored candidates): feedback capture
     // snapshots them so a replay fixture can re-run scoreFolders offline —
     // including sub-floor folders the recognizer wrongly dropped.
-    const { responses, rateLimited, sourceOffline } = await this.search(baseQs);
-    const candidates = scoreFolders(canonicalTracks, responses);
+    const w = await this.lanes.run('user', () => this.wave(baseQs));
+    const candidates = scoreFolders(canonicalTracks, w.responses);
     const bestBasePct = candidates.length ? candidates[0].matchPct : 0;
     const skewNeeded = opts.skewSearch !== false && bestBasePct < SKEW_TRIGGER_PCT;
-    return { candidates, skewNeeded, responses, rateLimited, sourceOffline };
+    return {
+      candidates,
+      skewNeeded,
+      queries: baseQs,
+      responses: w.responses,
+      searchesFired: w.fired,
+      searchesAnswered: w.answered,
+      rateLimited: w.rateLimited,
+      sourceOffline: w.sourceOffline,
+    };
   }
 
-  // Phase-2 of a two-phase hunt: run skew-variant queries and return their
-  // candidates independently. The caller (frontend) merges with base results.
+  // Phase-2 of a two-phase hunt: run skew-variant queries (in lane-sized waves,
+  // stopping at the first confident folder) and return their candidates
+  // independently. The caller (frontend) merges with base results.
   async huntSkew(
     artistName: string,
     albumTitle: string,
     canonicalTracks: CanonicalTrackRef[],
   ): Promise<HuntResult> {
     const baseQs = baseQueries(artistName, albumTitle);
-    const skewed = buildSkewedQueries(artistName, albumTitle, baseQs);
-    if (!skewed.length) return { candidates: [], rateLimited: false, sourceOffline: false };
-    return this.searchAndScore(skewed, canonicalTracks);
-  }
-
-  private async searchAndScore(
-    queries: string[],
-    canonicalTracks: CanonicalTrackRef[],
-  ): Promise<HuntResult> {
-    const { responses, rateLimited, sourceOffline } = await this.search(queries);
-    return { candidates: scoreFolders(canonicalTracks, responses), rateLimited, sourceOffline };
+    const skewed = buildSkewedQueries(artistName, albumTitle, baseQs).slice(0, MAX_SKEW_QUERIES);
+    const acc: HuntResult = {
+      candidates: [],
+      skewNeeded: false,
+      queries: [],
+      searchesFired: 0,
+      searchesAnswered: 0,
+      rateLimited: false,
+      sourceOffline: false,
+    };
+    if (!skewed.length) return acc;
+    return this.lanes.run('user', async () => {
+      for (let i = 0; i < skewed.length; i += SEARCH_LANES) {
+        const bestPct = acc.candidates.length ? acc.candidates[0].matchPct : 0;
+        if (bestPct >= SKEW_TRIGGER_PCT || acc.sourceOffline) break;
+        const chunk = skewed.slice(i, i + SEARCH_LANES);
+        const w = await this.wave(chunk);
+        acc.candidates = mergeCandidates(acc.candidates, scoreFolders(canonicalTracks, w.responses));
+        acc.queries.push(...chunk);
+        acc.searchesFired += w.fired;
+        acc.searchesAnswered += w.answered;
+        acc.rateLimited = acc.rateLimited || w.rateLimited;
+        acc.sourceOffline = acc.sourceOffline || w.sourceOffline;
+      }
+      return acc;
+    });
   }
 
   // Create one search, retrying a 429 (slskd rate-limiting the burst) with
-  // backoff. Returns the search, or null with the reason: `rateLimited`
-  // (retryable now — "still searching"), `sourceOffline` (slskd is logged out of
-  // Soulseek, retryable only once it is back), or neither, a genuine miss.
-  // A non-429 error is not retried — retrying a 409 in-loop is pointless,
-  // because the outage behind it lasts minutes, not milliseconds.
+  // backoff. Returns the search, or null with `rateLimited` telling the caller
+  // whether the miss was throttling (the hunt is incomplete) or a genuine
+  // failure (a genuine miss). A non-429 error is not retried.
   private async createSearch(
     q: string,
   ): Promise<{ search: { id: string } | null; rateLimited: boolean; sourceOffline: boolean }> {
     for (let attempt = 0; ; attempt++) {
       try {
-        const search = await this.slskd.searches.create(q);
+        const search = await this.slskd.searches.create(q, { searchTimeoutMs: SEARCH_TIMEOUT_MS });
         return { search, rateLimited: false, sourceOffline: false };
       } catch (err) {
         const is429 = err instanceof SlskdRequestError && err.status === 429;
@@ -441,11 +509,6 @@ export class AlbumHunterService {
           await sleep(SEARCH_429_BACKOFF_MS * (attempt + 1));
           continue;
         }
-        // A 409 is slskd refusing the search. Ask slskd's own state endpoint
-        // whether that is because it is logged out, rather than reading the
-        // exception text — the status alone does not say which conflict it is,
-        // and a message string from a third party is not an interface. The
-        // check also kicks the reconnect watchdog (throttled).
         const is409 = err instanceof SlskdRequestError && err.status === 409;
         const sourceOffline = is409 ? !(await this.source.isReady()) : false;
         log.warn({ q, err, sourceOffline }, 'Search create failed');
@@ -454,67 +517,79 @@ export class AlbumHunterService {
     }
   }
 
-  // The I/O half of a hunt: create the searches (bounded concurrency + 429
-  // retry), poll to completion, clean up, and return the raw slskd responses +
-  // whether any query stayed rate-limited after retries. Kept separate from
-  // `scoreFolders` (the pure recognizer) so a hunt can surface its raw responses
-  // for feedback capture without re-running the network.
-  private async search(
-    queries: string[],
-  ): Promise<{ responses: ScoreResponse[]; rateLimited: boolean; sourceOffline: boolean }> {
-    const created = await mapPool(queries, SEARCH_CREATE_CONCURRENCY, (q) => this.createSearch(q));
+  // The I/O half of one wave: create the searches, poll to completion, clean
+  // up, and return the raw slskd responses plus how many of the searches
+  // actually ran to completion. Kept separate from `scoreFolders` (the pure
+  // recognizer) so a hunt can surface its raw responses for feedback capture
+  // without re-running the network.
+  private async wave(queries: string[]): Promise<WaveResult> {
+    const created = await mapPool(queries, SEARCH_LANES, (q) => this.createSearch(q));
     const searchIds = created.map((c) => c.search?.id).filter((id): id is string => Boolean(id));
+    const sourceOffline = created.some((c) => c.sourceOffline);
     // Rate-limited only if a query was dropped to a 429 *and* we didn't otherwise
     // get results — an incomplete hunt the user can retry, not a genuine miss.
     const rateLimited = created.some((c) => c.rateLimited) && searchIds.length < queries.length;
-    // Any query dropped because the source was offline makes the whole hunt an
-    // untrustworthy miss: the surviving queries searched a network the dropped
-    // ones never reached, so an empty (or thin) result says nothing.
-    const sourceOffline = created.some((c) => c.sourceOffline);
     if (!searchIds.length) {
-      return { responses: [], rateLimited: created.some((c) => c.rateLimited), sourceOffline };
+      return {
+        responses: [],
+        fired: queries.length,
+        answered: 0,
+        rateLimited: created.some((c) => c.rateLimited),
+        sourceOffline,
+      };
     }
 
     try {
-      return { responses: await this.pollUntilDone(searchIds), rateLimited, sourceOffline };
+      const { responses, answered } = await this.pollUntilDone(searchIds);
+      return { responses, fired: queries.length, answered, rateLimited, sourceOffline };
     } finally {
       // Clean up searches (bounded — the same burst that 429s creates also 429s
       // deletes, and leaked searches pile up in slskd's history).
-      await mapPool(searchIds, SEARCH_CREATE_CONCURRENCY, (id) =>
+      await mapPool(searchIds, SEARCH_LANES, (id) =>
         this.slskd.searches.delete(id).catch(() => {}),
       );
     }
   }
 
-  private async pollUntilDone(searchIds: string[]): Promise<
-    Array<{
-      username: string;
-      freeUploadSlots: number;
-      queueLength: number;
-      uploadSpeed: number;
-      files: Array<{ filename: string; size: number; bitRate?: number }>;
-    }>
-  > {
-    const deadline = Date.now() + HUNT_TIMEOUT_MS;
+  private async pollUntilDone(
+    searchIds: string[],
+  ): Promise<{ responses: ScoreResponse[]; answered: number }> {
+    const deadline = Date.now() + this.waveTimeoutMs;
+    let states: Array<{ state: string } | null> = [];
 
     while (Date.now() < deadline) {
-      const states = await Promise.all(
+      states = await Promise.all(
         searchIds.map((id) => this.slskd.searches.get(id).catch(() => null)),
       );
-
-      const allDone = states.every((s) => !s || s.state !== 'InProgress');
-      if (allDone) break;
-
-      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+      if (states.every((s) => !s || searchIsDone(s.state))) break;
+      await new Promise((r) => setTimeout(r, this.pollIntervalMs));
     }
+
+    // A search still `Queued`/`InProgress` at the deadline (or one slskd
+    // errored) answered nothing — the count is what lets the host tell "the
+    // album is not there" from "the source was busy" (#1049).
+    const answered = states.filter((s) => s && searchIsDone(s.state) && !s.state.includes('Errored')).length;
 
     // Gather all responses from all searches
     const responseSets = await Promise.all(
       searchIds.map((id) => this.slskd.searches.getResponses(id).catch(() => [])),
     );
 
-    return responseSets.flat();
+    return { responses: responseSets.flat(), answered };
   }
+}
+
+/** slskd reports a finished search as `Completed[, <reason>]`; anything else is still queued or running. */
+function searchIsDone(state: string): boolean {
+  return state.startsWith('Completed');
+}
+
+interface WaveResult {
+  responses: ScoreResponse[];
+  fired: number;
+  answered: number;
+  rateLimited: boolean;
+  sourceOffline: boolean;
 }
 
 // Merge two candidate lists (base + skewed), de-duplicating by the unique

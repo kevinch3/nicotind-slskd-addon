@@ -7,6 +7,7 @@ import {
   type AlternateCandidate,
 } from './album-fallback.service.js';
 import type { Slskd } from '@nicotind/slskd-client';
+import type { SearchLanes } from './search-lanes.js';
 
 interface MockFile {
   id: string;
@@ -333,11 +334,21 @@ describe('AlbumFallbackService', () => {
       alternates: [],
     });
 
-    const svc = new AlbumFallbackService(slskd, { db, host: NOOP_FALLBACK_HOST });
+    // #1049: the fresh search takes its turn on the shared lanes at background
+    // priority, so a curator's hunt is never queued behind a fallback wave.
+    const priorities: string[] = [];
+    const lanes = {
+      run: mock(async (priority: string, fn: () => Promise<unknown>) => {
+        priorities.push(priority);
+        return fn();
+      }),
+    } as unknown as SearchLanes;
+    const svc = new AlbumFallbackService(slskd, { db, host: NOOP_FALLBACK_HOST, lanes });
     await svc.sweep();
+    expect(priorities).toEqual(['background']);
 
     // Query uses the normalized (folded/lowercased) track title.
-    expect(create).toHaveBeenCalledWith('Artist song two');
+    expect(create).toHaveBeenCalledWith('Artist song two', { searchTimeoutMs: 8000 });
     expect(enqueue).toHaveBeenCalledTimes(1);
     const [user, files] = enqueue.mock.calls[0];
     expect(user).toBe('freshpeer');

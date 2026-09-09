@@ -2,6 +2,9 @@ import { createLogger, normalizeTitle, titlesOverlap } from '@nicotind/addon-sdk
 import type { Slskd } from '@nicotind/slskd-client';
 import type { Database } from 'bun:sqlite';
 
+import { SearchLanes } from './search-lanes.js';
+import { SEARCH_TIMEOUT_MS } from './album-hunter.service.js';
+
 const log = createLogger('album-fallback');
 
 /**
@@ -129,6 +132,12 @@ interface ExhaustedJobRow {
 
 export interface AlbumFallbackOptions {
   db: Database;
+  /**
+   * The source's search lanes, shared with the album hunter. Fallback searches
+   * run at `background` priority so a curator's hunt never waits behind a
+   * per-track wave (#1049).
+   */
+  lanes?: SearchLanes;
   /** Host-side sync (unified job repoints/closure + on-disk suppression). */
   host?: FallbackHost;
   /** Max alternate peers to try per album before giving up. */
@@ -157,6 +166,7 @@ export interface AlbumFallbackOptions {
  */
 export class AlbumFallbackService {
   private slskd: Slskd;
+  private readonly lanes: SearchLanes;
   private db: Database;
   private host: FallbackHost;
   private maxFallbackAttempts: number;
@@ -174,6 +184,7 @@ export class AlbumFallbackService {
 
   constructor(slskd: Slskd, options: AlbumFallbackOptions) {
     this.slskd = slskd;
+    this.lanes = options.lanes ?? new SearchLanes();
     this.db = options.db;
     this.host = options.host ?? NOOP_FALLBACK_HOST;
     this.maxFallbackAttempts = options.maxFallbackAttempts ?? 3;
@@ -459,9 +470,21 @@ export class AlbumFallbackService {
     username: string;
     file: { filename: string; size: number; bitRate?: number };
   } | null> {
+    return this.lanes.run('background', () => this.freshSearch(artistName, title));
+  }
+
+  private async freshSearch(
+    artistName: string,
+    title: string,
+  ): Promise<{
+    username: string;
+    file: { filename: string; size: number; bitRate?: number };
+  } | null> {
     let search: { id: string } | null = null;
     try {
-      search = await this.slskd.searches.create(`${artistName} ${title}`);
+      search = await this.slskd.searches.create(`${artistName} ${title}`, {
+        searchTimeoutMs: SEARCH_TIMEOUT_MS,
+      });
     } catch (err) {
       log.debug({ title, err }, 'Fresh-search create failed');
       return null;
@@ -471,7 +494,7 @@ export class AlbumFallbackService {
       const deadline = Date.now() + FRESH_SEARCH_TIMEOUT_MS;
       while (Date.now() < deadline) {
         const state = await this.slskd.searches.get(search.id).catch(() => null);
-        if (!state || state.state !== 'InProgress') break;
+        if (!state || state.state.startsWith('Completed')) break;
         await new Promise((r) => setTimeout(r, FRESH_SEARCH_POLL_MS));
       }
 

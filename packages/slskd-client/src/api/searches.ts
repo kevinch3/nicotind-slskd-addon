@@ -17,6 +17,15 @@ import { MinIntervalGate } from '../min-interval-gate.js';
  */
 export const DEFAULT_SEARCH_MIN_INTERVAL_MS = 0;
 
+export interface SearchCreateOptions {
+  /**
+   * Per-search inactivity timeout slskd forwards to Soulseek.NET (`searchTimeout`,
+   * default 15 000 ms there). The search holds one of the client's two search
+   * lanes until this much time passes with no new response (NicotinD#1049).
+   */
+  searchTimeoutMs?: number;
+}
+
 export class SearchesApi {
   private readonly gate: MinIntervalGate;
 
@@ -48,11 +57,15 @@ export class SearchesApi {
    * It cannot be, either: because slskd serializes for us, our submissions to
    * the network were never concurrent in the first place.
    */
-  async create(searchText: string): Promise<SlskdSearch> {
+  async create(searchText: string, opts: SearchCreateOptions = {}): Promise<SlskdSearch> {
     return this.gate.run(() =>
       this.client.request<SlskdSearch>('/searches', {
         method: 'POST',
-        body: JSON.stringify({ id: crypto.randomUUID(), searchText }),
+        body: JSON.stringify({
+          id: crypto.randomUUID(),
+          searchText,
+          ...(opts.searchTimeoutMs !== undefined ? { searchTimeout: opts.searchTimeoutMs } : {}),
+        }),
       }),
     );
   }
