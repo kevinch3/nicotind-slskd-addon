@@ -6,6 +6,7 @@ import { createAddonApp } from './server.js';
 import { AlbumHunterService } from './services/album-hunter.service.js';
 import { TrackHunterService } from './services/track-hunter.service.js';
 import { AlbumFallbackService } from './services/album-fallback.service.js';
+import { SearchLanes } from './services/search-lanes.js';
 import { DownloadRetryService } from './services/download-retry.service.js';
 import { makeAddonFallbackHost } from './services/addon-fallback-host.js';
 import { TransferPoller } from './services/transfer-poller.js';
@@ -33,10 +34,15 @@ function makeSlskd(): Slskd {
 
 const slskdRef = { current: makeSlskd() };
 
+// The source runs two searches at a time; every search session in the process
+// (hunt, track hunt, fallback wave) takes its turn here (#1049).
+const lanes = new SearchLanes();
+
 // Hunt/fallback/retry engine over the addon's own tables. The fallback host
 // mirrors wave events onto the protocol job ledger the core host polls.
 const fallback = new AlbumFallbackService(slskdRef.current, {
   db,
+  lanes,
   host: makeAddonFallbackHost(db),
   autoRetryExhausted: true,
 });
@@ -107,8 +113,8 @@ const app = createAddonApp({
     log.info('config updated — slskd client rebuilt');
   },
   engine: {
-    hunter: () => new AlbumHunterService(slskdRef.current),
-    trackHunter: () => new TrackHunterService(slskdRef.current),
+    hunter: () => new AlbumHunterService(slskdRef.current, undefined, lanes),
+    trackHunter: () => new TrackHunterService(slskdRef.current, { lanes }),
     downloadsDir: () => config.downloadsDir,
   },
 });

@@ -10,6 +10,7 @@ import {
   stripTitleQualifiers,
 } from './album-hunter.service';
 import { SourceConnection, KICK_GRACE_MS } from './source-connection.js';
+import { SearchLanes } from './search-lanes.js';
 
 function track(_id: number, title: string): { title: string } {
   return { title };
@@ -61,6 +62,90 @@ function makeQueryAwareSlskdStub(byQuery: Record<string, StubResponse[]>) {
 const TRACKS = [track(1, 'Song One'), track(2, 'Song Two'), track(3, 'Song Three')];
 
 describe('AlbumHunterService', () => {
+  // #1049: the source runs two searches at a time. A hunt fires exactly that many
+  // per wave, stops as soon as a wave is confidently complete, and reports how
+  // many of its searches actually ran so the host can tell "busy" from "absent".
+  describe('lane-sized waves (#1049)', () => {
+    const FULL = (dir: string): StubResponse[] => [
+      {
+        username: 'alice',
+        files: TRACKS.map((t, i) => ({ filename: `${dir}\\0${i + 1} ${t.title}.flac`, size: 1_000_000 })),
+      },
+    ];
+
+    it('sends the per-search timeout on every create', async () => {
+      const slskd = makeSlskdStub(FULL('Music\\Artist\\Album'));
+      await new AlbumHunterService(slskd).hunt('Artist', 'Album', TRACKS);
+      expect(slskd.searches.create).toHaveBeenCalledWith('Artist Album', { searchTimeoutMs: 8000 });
+    });
+
+    it('fires the base pair, then skew variants two at a time, stopping at the first confident wave', async () => {
+      // Base misses; the first skew wave (fold + punctuation-strip variants) hits.
+      const slskd = makeQueryAwareSlskdStub({ 'Artist Album': [], 'Artist - Album': [], 'Album Artist': FULL('Music\\Artist\\Album') });
+      const res = await new AlbumHunterService(slskd).hunt('Artist', 'Album', TRACKS, { skewSearch: true });
+      const fired = (slskd.searches.create as ReturnType<typeof mock>).mock.calls.map((c) => c[0]);
+      // 2 base + one wave of 2 — never the whole skew list, never the base again.
+      expect(fired).toEqual(['Artist Album', 'Artist - Album', 'Album Artist', 'Album']);
+      expect(res.queries).toEqual(fired);
+      expect(res.candidates[0]!.matchPct).toBe(100);
+      expect(res.searchesFired).toBe(4);
+      expect(res.searchesAnswered).toBe(4);
+      expect(res.skewNeeded).toBe(true);
+    });
+
+    it('a confident base wave fires no skew searches at all', async () => {
+      const slskd = makeSlskdStub(FULL('Music\\Artist\\Album'));
+      const res = await new AlbumHunterService(slskd).hunt('Artist', 'Album', TRACKS, { skewSearch: true });
+      expect(slskd.searches.create).toHaveBeenCalledTimes(2);
+      expect(res.skewNeeded).toBe(false);
+      expect(res.searchesFired).toBe(2);
+    });
+
+    it('a search still Queued at the wave deadline counts as fired but not answered', async () => {
+      // The lanes are held by someone else: slskd accepts the create but never
+      // starts the search. The old code read `Queued` as done and reported an
+      // honest-looking empty hunt.
+      const slskd = {
+        searches: {
+          create: mock(async (q: string) => ({ id: `s-${q}`, state: 'Queued' })),
+          get: mock(async () => ({ state: 'Queued' })),
+          getResponses: mock(async () => []),
+          delete: mock(async () => undefined),
+        },
+      } as unknown as Slskd;
+      const hunter = new AlbumHunterService(slskd, undefined, undefined, { waveTimeoutMs: 30, pollIntervalMs: 5 });
+      const res = await hunter.hunt('Artist', 'Album', TRACKS);
+      expect(res.candidates).toEqual([]);
+      expect(res.searchesFired).toBe(2);
+      expect(res.searchesAnswered).toBe(0);
+      // Still cleaned up, so the queued searches do not keep holding a lane later.
+      expect(slskd.searches.delete).toHaveBeenCalledTimes(2);
+    });
+
+    it('a second hunt waits for the first when they share the lanes', async () => {
+      const lanes = new SearchLanes();
+      let releaseFirst!: () => void;
+      const gate = new Promise<void>((r) => (releaseFirst = r));
+      const slow = {
+        searches: {
+          create: mock(async (q: string) => ({ id: `s-${q}`, state: 'InProgress' })),
+          get: mock(async () => { await gate; return { state: 'Completed' }; }),
+          getResponses: mock(async () => FULL('Music\\Artist\\Album')),
+          delete: mock(async () => undefined),
+        },
+      } as unknown as Slskd;
+      const fast = makeSlskdStub(FULL('Music\\Artist\\Other'));
+      const first = new AlbumHunterService(slow, undefined, lanes).hunt('Artist', 'Album', TRACKS);
+      const second = new AlbumHunterService(fast, undefined, lanes).hunt('Artist', 'Other', TRACKS);
+      await new Promise((r) => setTimeout(r, 10));
+      expect(fast.searches.create).not.toHaveBeenCalled();
+      expect(lanes.pending).toBe(1);
+      releaseFirst();
+      await Promise.all([first, second]);
+      expect(fast.searches.create).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it('groups files by folder and scores match % against the tracklist', async () => {
     const slskd = makeSlskdStub([
       {

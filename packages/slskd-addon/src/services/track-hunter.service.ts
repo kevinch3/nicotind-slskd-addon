@@ -2,9 +2,14 @@ import { createLogger } from '@nicotind/addon-sdk';
 import type { Slskd } from '@nicotind/slskd-client';
 import { buildTrackQueries, pickBestTrackFile, type TrackPick } from './track-pick.js';
 
+import { SearchLanes } from './search-lanes.js';
+import { SEARCH_TIMEOUT_MS } from './album-hunter.service.js';
+
 const log = createLogger('track-hunter');
 
 export interface TrackHunterOptions {
+  /** The source's search lanes, shared with the album hunter (#1049). */
+  lanes?: SearchLanes;
   /** Poll interval while a per-track search runs. */
   pollMs?: number;
   /** Max time to wait for a per-track search to settle. */
@@ -38,6 +43,7 @@ export interface TrackHuntResult {
 export class TrackHunterService {
   private readonly pollMs: number;
   private readonly timeoutMs: number;
+  private readonly lanes: SearchLanes;
 
   constructor(
     private slskd: Slskd,
@@ -45,6 +51,7 @@ export class TrackHunterService {
   ) {
     this.pollMs = opts.pollMs ?? 2_000;
     this.timeoutMs = opts.timeoutMs ?? 20_000;
+    this.lanes = opts.lanes ?? new SearchLanes();
   }
 
   /** Hunt every title and enqueue the best match found for each. */
@@ -98,18 +105,21 @@ export class TrackHunterService {
    * ban. A first-query hit fires no extra searches.
    */
   private async huntTrack(artistName: string, title: string): Promise<TrackPick | null> {
-    for (const query of buildTrackQueries(artistName, title)) {
-      const pick = await this.runQuery(query, title);
-      if (pick) return pick;
-    }
-    return null;
+    // One lane session per track: the progressively skewed queries run inside it.
+    return this.lanes.run('user', async () => {
+      for (const query of buildTrackQueries(artistName, title)) {
+        const pick = await this.runQuery(query, title);
+        if (pick) return pick;
+      }
+      return null;
+    });
   }
 
   /** One slskd search for a query → the best file matching `title` (or null). */
   private async runQuery(query: string, title: string): Promise<TrackPick | null> {
     let search: { id: string } | null = null;
     try {
-      search = await this.slskd.searches.create(query);
+      search = await this.slskd.searches.create(query, { searchTimeoutMs: SEARCH_TIMEOUT_MS });
     } catch (err) {
       log.debug({ query, err }, 'Track-hunt search create failed');
       return null;
@@ -119,7 +129,7 @@ export class TrackHunterService {
       const deadline = Date.now() + this.timeoutMs;
       while (Date.now() < deadline) {
         const state = await this.slskd.searches.get(search.id).catch(() => null);
-        if (!state || state.state !== 'InProgress') break;
+        if (!state || state.state.startsWith('Completed')) break;
         await new Promise((r) => setTimeout(r, this.pollMs));
       }
       const responses = await this.slskd.searches.getResponses(search.id).catch(() => []);

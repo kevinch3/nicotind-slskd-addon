@@ -6,8 +6,6 @@ import {
   addonAlbumSearchRequestSchema,
   addonJobRequestSchema,
   addonSearchRequestSchema,
-  baseQueries,
-  buildSkewedQueries,
   createLogger,
   type AddonAlbumSearchResponse,
   type AddonSearchResult,
@@ -144,32 +142,29 @@ export function createProtocolRoutes(deps: ProtocolRouteDeps): Hono {
     const { artist, album, canonicalTracks, skew } = parsed.data;
     const hunter = deps.hunter();
     try {
-      const base = await hunter.huntBase(artist, album, canonicalTracks, { skewSearch: true });
-      let folderCandidates = base.candidates;
-      let rateLimited = base.rateLimited;
-      let sourceOffline = base.sourceOffline;
-      const skewRan = skew === true || base.skewNeeded;
-      if (skewRan) {
-        const full = await hunter.hunt(artist, album, canonicalTracks, { skewSearch: true });
-        folderCandidates = full.candidates;
-        rateLimited = rateLimited || full.rateLimited;
-        sourceOffline = sourceOffline || full.sourceOffline;
-      }
-      const queries = [
-        ...baseQueries(artist, album),
-        ...(skewRan ? buildSkewedQueries(artist, album, baseQueries(artist, album)) : []),
-      ];
+      // One lane session: the base pair, then skew waves only while nothing is
+      // confidently complete (or always when the caller forces skew). The base
+      // is never re-run for the skew phase — it used to be, doubling the lane
+      // time of every hunt that needed skew (#1049).
+      const res = await hunter.hunt(artist, album, canonicalTracks, {
+        skewSearch: skew === true || undefined,
+      });
       const body: AddonAlbumSearchResponse = {
-        candidates: candidates.put(folderCandidates),
-        queries,
-        skewNeeded: base.skewNeeded,
+        candidates: candidates.put(res.candidates),
+        queries: res.queries,
+        skewNeeded: res.skewNeeded,
+        // Searches submitted vs completed inside the deadline. Fewer answered than
+        // fired means the source's lanes were busy and the hunt was cut short —
+        // the host must not read an empty result as "not there" (#1049).
+        searchesFired: res.searchesFired,
+        searchesAnswered: res.searchesAnswered,
         // slskd throttled the search burst (429) and some queries were dropped —
         // the hunt may be incomplete, so the UI keeps trying rather than reporting
         // a genuine "no results". Omitted when false to keep the wire additive.
-        ...(rateLimited ? { rateLimited: true } : {}),
+        ...(res.rateLimited ? { rateLimited: true } : {}),
         // The queries never reached Soulseek — slskd is logged out. Reported so
         // the host holds the acquire for retry instead of recording a miss.
-        ...(sourceOffline ? { sourceOffline: true } : {}),
+        ...(res.sourceOffline ? { sourceOffline: true } : {}),
       };
       return c.json(body);
     } catch (err) {
