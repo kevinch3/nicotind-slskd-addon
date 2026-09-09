@@ -388,7 +388,7 @@ export class AlbumHunterService {
     artistName: string,
     albumTitle: string,
     canonicalTracks: CanonicalTrackRef[],
-    opts: { skewSearch?: boolean } = {},
+    opts: { skewSearch?: boolean; forceSkew?: boolean } = {},
   ): Promise<HuntResult> {
     return this.lanes.run('user', async () => {
       const baseQs = baseQueries(artistName, albumTitle);
@@ -405,7 +405,10 @@ export class AlbumHunterService {
         rateLimited: base.rateLimited,
         sourceOffline: base.sourceOffline,
       };
-      if (!opts.skewSearch || !skewNeeded) return acc;
+      // Skew runs when the caller enabled it and the base was not confident, or
+      // when the caller forces it; either way each wave stops at a confident folder.
+      const runSkew = opts.forceSkew === true || (opts.skewSearch === true && skewNeeded);
+      if (!runSkew) return acc;
 
       const skewed = buildSkewedQueries(artistName, albumTitle, baseQs).slice(0, MAX_SKEW_QUERIES);
       for (let i = 0; i < skewed.length; i += SEARCH_LANES) {

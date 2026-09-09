@@ -93,6 +93,14 @@ describe('AlbumHunterService', () => {
       expect(res.skewNeeded).toBe(true);
     });
 
+    it('forceSkew still stops at a confident base wave instead of holding the lanes', async () => {
+      const slskd = makeQueryAwareSlskdStub({ 'Artist Album': FULL('Music\\Artist\\Album'), 'Artist - Album': [], 'Album Artist': [], 'Album': [] });
+      const res = await new AlbumHunterService(slskd).hunt('Artist', 'Album', TRACKS, { forceSkew: true });
+      expect(res.skewNeeded).toBe(false);
+      // The base pair was confident, so no skew wave was worth a lane cycle.
+      expect(res.searchesFired).toBe(2);
+    });
+
     it('a confident base wave fires no skew searches at all', async () => {
       const slskd = makeSlskdStub(FULL('Music\\Artist\\Album'));
       const res = await new AlbumHunterService(slskd).hunt('Artist', 'Album', TRACKS, { skewSearch: true });
