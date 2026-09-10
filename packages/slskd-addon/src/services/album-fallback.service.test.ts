@@ -6,6 +6,7 @@ import {
   NOOP_FALLBACK_HOST,
   type AlternateCandidate,
 } from './album-fallback.service.js';
+import { SlskdRequestError } from '@nicotind/slskd-client';
 import type { Slskd } from '@nicotind/slskd-client';
 import type { SearchLanes } from './search-lanes.js';
 
@@ -833,5 +834,126 @@ describe('AlbumFallbackService — concurrent-peer fan-out (#264)', () => {
       (call[1] as Array<{ filename: string }>).map((f) => f.filename),
     );
     expect(enqueued).not.toContain('Alt3Album/02 Song Two.flac');
+  });
+});
+
+describe('AlbumFallbackService — an alternate that cannot be enqueued (issue #13)', () => {
+  let db: Database;
+  beforeEach(() => {
+    db = makeDb();
+  });
+
+  /** Primary gave up on tracks two and three, so the sweep reaches for an alternate. */
+  function primaryGaveUp() {
+    const groups = [
+      {
+        username: 'primary',
+        directory: 'Album',
+        files: [
+          { id: 'p1', filename: 'Album/01 Song One.flac', size: 1, state: 'Completed, Succeeded' },
+          { id: 'p2', filename: 'Album/02 Song Two.flac', size: 1, state: 'Completed, Errored' },
+          { id: 'p3', filename: 'Album/03 Song Three.flac', size: 1, state: 'Completed, Errored' },
+        ],
+      },
+    ];
+    db.run(
+      `INSERT INTO transfer_retries (transfer_key, username, filename, attempts, gave_up) VALUES
+       ('primary::Album/02 Song Two.flac', 'primary', 'x', 3, 1),
+       ('primary::Album/03 Song Three.flac', 'primary', 'x', 3, 1)`,
+    );
+    return groups;
+  }
+
+  const OFFLINE: AlternateCandidate = {
+    username: 'ShaneW',
+    directory: 'Offline',
+    files: [
+      { filename: 'Offline/02 Song Two.flac', size: 1 },
+      { filename: 'Offline/03 Song Three.flac', size: 1 },
+    ],
+  };
+
+  function alternatesLeft(): number {
+    const row = db.query('SELECT alternates_json AS j FROM album_jobs WHERE id = 1').get() as {
+      j: string;
+    };
+    return (JSON.parse(row.j) as AlternateCandidate[]).length;
+  }
+
+  it('moves to the next alternate instead of re-picking the offline one every sweep', async () => {
+    // slskd answers, but the peer is gone: `UserOfflineException` reaches us as
+    // a 500. Re-picking that same peer is what burned 8,256 requests in 24h.
+    const groups = primaryGaveUp();
+    const { slskd, enqueue } = makeSlskd(groups);
+    (enqueue as unknown as { mockImplementation: (f: unknown) => void }).mockImplementation(
+      async (user: string) => {
+        if (user === 'ShaneW') {
+          throw new SlskdRequestError(
+            'slskd request failed: 500 /transfers/downloads/ShaneW',
+            500,
+            '/transfers/downloads/ShaneW',
+          );
+        }
+        return undefined;
+      },
+    );
+    recordJob(db, [OFFLINE, ALT]);
+
+    const svc = new AlbumFallbackService(slskd, { db, host: NOOP_FALLBACK_HOST });
+    await svc.sweep();
+    await svc.sweep();
+
+    const tried = enqueue.mock.calls.map((c) => c[0] as string);
+    // The offline peer is asked at most once; the second sweep reaches the
+    // alternate that can actually serve the tracks.
+    expect(tried.filter((u) => u === 'ShaneW').length).toBe(1);
+    expect(tried).toContain('alt');
+  });
+
+  it('eventually exhausts rather than sweeping an unusable alternate forever', async () => {
+    const groups = primaryGaveUp();
+    const { slskd, enqueue } = makeSlskd(groups);
+    (enqueue as unknown as { mockImplementation: (f: unknown) => void }).mockImplementation(
+      async () => {
+        throw new SlskdRequestError('slskd request failed: 500 /x', 500, '/x');
+      },
+    );
+    recordJob(db, [OFFLINE]);
+
+    const svc = new AlbumFallbackService(slskd, {
+      db,
+      host: NOOP_FALLBACK_HOST,
+      maxFallbackAttempts: 2,
+    });
+    for (let i = 0; i < 6; i++) await svc.sweep();
+
+    // Bounded work: the candidate is consumed and the cap is respected, instead
+    // of one job re-asking the same dead peer every 15s indefinitely.
+    expect(alternatesLeft()).toBe(0);
+    expect(enqueue.mock.calls.length).toBeLessThanOrEqual(2);
+  });
+
+  it('does NOT burn alternates when slskd itself is unreachable', async () => {
+    // A network-level throw carries no HTTP status: slskd never answered, so
+    // this says nothing about the peer. Burning the candidate list through a
+    // brief slskd outage would turn an infra blip into a permanently
+    // downgraded album.
+    const groups = primaryGaveUp();
+    const { slskd, enqueue } = makeSlskd(groups);
+    (enqueue as unknown as { mockImplementation: (f: unknown) => void }).mockImplementation(
+      async () => {
+        throw new Error('connect ECONNREFUSED 127.0.0.1:5030');
+      },
+    );
+    recordJob(db, [OFFLINE, ALT]);
+
+    const svc = new AlbumFallbackService(slskd, { db, host: NOOP_FALLBACK_HOST });
+    await svc.sweep();
+    await svc.sweep();
+
+    expect(alternatesLeft()).toBe(2);
+    expect(attempts(db)).toBe(0);
+    expect(jobState(db)).toBe('active');
+    expect(enqueue.mock.calls.length).toBeGreaterThan(0);
   });
 });
