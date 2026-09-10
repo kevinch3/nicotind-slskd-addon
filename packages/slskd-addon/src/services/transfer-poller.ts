@@ -4,6 +4,9 @@ import type { Database } from 'bun:sqlite';
 import { basename, join, relative } from 'node:path';
 import { existsSync } from 'node:fs';
 
+/** How long an unresolved completion keeps being looked for on disk. */
+const LATE_ARRIVAL_WINDOW_MS = 7 * 24 * 3_600_000;
+
 const log = createLogger('transfer-poller');
 
 /** One newly-completed slskd transfer, with its local path resolved. */
@@ -118,6 +121,7 @@ export class TransferPoller {
       }
 
       if (completed.length) await this.onCompleted(completed);
+      await this.resolveLateArrivals();
     } catch (err) {
       const msg = err instanceof Error ? err.message : '';
       if (msg.includes('Unable to connect') || msg.includes('ConnectionRefused')) {
@@ -194,6 +198,69 @@ export class TransferPoller {
     } catch {
       log.warn('recordCompletedDownload: DB not ready or write failed');
     }
+  }
+
+  /**
+   * A completion is resolved to a path exactly once, on the tick that first
+   * sees `Completed, Succeeded` — and slskd flips that state while it is still
+   * moving the file out of `incomplete/`. Land between the two and the file
+   * was recorded as never having arrived: `file_ready=0`, the host's card at
+   * "Organizing 4 of 9" for good (8 rows on kpc, every file on disk, #17).
+   * So look again, cheaply, at the recent completions still unresolved.
+   */
+  private async resolveLateArrivals(): Promise<void> {
+    if (!this.rootDir) return;
+    let rows: Array<{
+      transfer_key: string;
+      username: string;
+      directory: string;
+      filename: string;
+      completed_at: number | null;
+    }>;
+    try {
+      rows = this.db()
+        .query<
+          {
+            transfer_key: string;
+            username: string;
+            directory: string;
+            filename: string;
+            completed_at: number | null;
+          },
+          [number]
+        >(
+          `SELECT transfer_key, username, directory, filename, completed_at
+             FROM completed_downloads
+            WHERE relative_path IS NULL AND COALESCE(completed_at, 0) > ?`,
+        )
+        .all(Date.now() - LATE_ARRIVAL_WINDOW_MS);
+    } catch {
+      return;
+    }
+    const arrived: PolledCompletion[] = [];
+    for (const row of rows) {
+      const relativePath = this.resolveRelativePath(row.directory, row.filename);
+      if (!relativePath) continue;
+      try {
+        this.db().run(`UPDATE completed_downloads SET relative_path = ? WHERE transfer_key = ?`, [
+          relativePath,
+          row.transfer_key,
+        ]);
+      } catch {
+        continue;
+      }
+      arrived.push({
+        transferKey: row.transfer_key,
+        username: row.username,
+        directory: row.directory,
+        filename: row.filename,
+        directoryFileCount: 0,
+        relativePath,
+        completedAt: row.completed_at ?? Date.now(),
+      });
+      log.info({ username: row.username, filename: row.filename }, 'Download resolved on disk late');
+    }
+    if (arrived.length) await this.onCompleted(arrived);
   }
 
   private resolveRelativePath(directory: string, filename: string): string | null {

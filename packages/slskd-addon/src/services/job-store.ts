@@ -179,11 +179,21 @@ export function markItemsCompletedByTransfer(
 ): void {
   const now = Date.now();
   for (const c of completions) {
+    const ready = c.fileReady ? 1 : 0;
+    // A row already `completed` but not ready is a file the poller resolved
+    // late (#17): flip it, and announce the job — the host polls by the job's
+    // updated_at, so a ready flag nobody bumps is a ready flag nobody sees.
     db.run(
       `UPDATE addon_job_items
        SET state = 'completed', file_ready = ?, updated_at = ?
-       WHERE username = ? AND filename = ? AND state != 'completed'`,
-      [c.fileReady ? 1 : 0, now, c.username, c.filename],
+       WHERE username = ? AND filename = ?
+         AND (state != 'completed' OR (file_ready = 0 AND ? = 1))`,
+      [ready, now, c.username, c.filename, ready],
+    );
+    db.run(
+      `UPDATE addon_jobs SET updated_at = ? WHERE id IN (
+         SELECT job_id FROM addon_job_items WHERE username = ? AND filename = ? AND updated_at = ?)`,
+      [now, c.username, c.filename, now],
     );
   }
   // Recompute every touched active job.
