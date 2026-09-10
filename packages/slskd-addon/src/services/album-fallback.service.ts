@@ -1,4 +1,5 @@
 import { createLogger, normalizeTitle, titlesOverlap } from '@nicotind/addon-sdk';
+import { SlskdRequestError } from '@nicotind/slskd-client';
 import type { Slskd } from '@nicotind/slskd-client';
 import type { Database } from 'bun:sqlite';
 
@@ -326,6 +327,26 @@ export class AlbumFallbackService {
         try {
           await this.slskd.transfers.enqueue(picked.alternate.username, picked.files);
         } catch (err) {
+          // slskd ANSWERED and refused (issue #13). The commonest cause is the
+          // peer having gone offline since we recorded it, which slskd reports
+          // as `UserOfflineException` behind a plain 500 — indistinguishable by
+          // status from any other refusal, and equally not worth re-asking.
+          // `pickAlternate` is deterministic, so leaving the candidate in place
+          // meant re-picking that same dead peer every sweep: one job spent 24h
+          // and 8,256 requests on it. Consume the candidate and count the
+          // attempt, exactly as the fresh-search path below already does, so
+          // the next sweep tries a different peer and the cap can be reached.
+          if (err instanceof SlskdRequestError) {
+            this.consumeAlternate(job.id, alternates, picked.alternate);
+            log.warn(
+              { jobId: job.id, peer: picked.alternate.username, status: err.status, err },
+              'Fallback enqueue refused by slskd; dropping that alternate',
+            );
+            continue;
+          }
+          // No HTTP status: slskd never answered (down, DNS, connection reset).
+          // That says nothing about the peer, so keep the candidate — burning
+          // the list through a brief outage would strand the album for good.
           log.warn({ jobId: job.id, err }, 'Fallback enqueue failed; will retry next sweep');
           continue;
         }
@@ -348,11 +369,7 @@ export class AlbumFallbackService {
         );
 
         // Consume the used alternate and bump the attempt counter.
-        const remaining = alternates.filter((a) => a !== picked.alternate);
-        this.db.run(
-          'UPDATE album_jobs SET alternates_json = ?, fallback_attempts = fallback_attempts + 1 WHERE id = ?',
-          [JSON.stringify(remaining), job.id],
-        );
+        this.consumeAlternate(job.id, alternates, picked.alternate);
         continue;
       }
 
@@ -378,6 +395,26 @@ export class AlbumFallbackService {
         );
       }
     }
+  }
+
+  /**
+   * Drop a candidate from the job's alternate list and count the wave.
+   *
+   * Both outcomes of an enqueue attempt land here — a peer we successfully
+   * pulled from is spent, and one slskd refused is no better. Not counting a
+   * refusal was the whole of issue #13: `fallback_attempts` never reached
+   * `maxFallbackAttempts`, so the job could never exhaust.
+   */
+  private consumeAlternate(
+    jobId: number,
+    alternates: AlternateCandidate[],
+    used: AlternateCandidate,
+  ): void {
+    const remaining = alternates.filter((a) => a !== used);
+    this.db.run(
+      'UPDATE album_jobs SET alternates_json = ?, fallback_attempts = fallback_attempts + 1 WHERE id = ?',
+      [JSON.stringify(remaining), jobId],
+    );
   }
 
   /**
