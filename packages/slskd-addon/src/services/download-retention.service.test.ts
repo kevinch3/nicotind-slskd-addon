@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Slskd } from '@nicotind/slskd-client';
 import { applySchema } from '../db.js';
-import { DownloadRetentionService } from './download-retention.service.js';
+import { DownloadRetentionService, measureDownloadsDir } from './download-retention.service.js';
 
 const DAY = 86_400_000;
 const dirs: string[] = [];
@@ -248,5 +248,45 @@ describe('DownloadRetentionService (#1052)', () => {
 
     expect(res.removed).toBe(0);
     expect(db.query(`SELECT * FROM completed_downloads`).all()).toHaveLength(0);
+  });
+
+  /**
+   * A disabled sweep must still see the directory it isn't cleaning
+   * (NicotinD#1052) — otherwise "off" and "silently growing toward a full
+   * disk" look identical from the logs.
+   */
+  it('never deletes anything while disabled, however large the directory', async () => {
+    const db = makeDb();
+    const root = makeRoot();
+    const files = Array.from({ length: 5 }, (_, i) =>
+      land(db, root, { relPath: `Album/${i} Track.flac`, ageDays: 90 }),
+    );
+
+    const res = await service(db, root, { retentionDays: () => 0 }).sweep();
+
+    expect(res).toEqual({ removed: 0, bytes: 0 });
+    for (const abs of files) expect(existsSync(abs)).toBe(true);
+    expect(db.query(`SELECT * FROM completed_downloads`).all()).toHaveLength(5);
+  });
+});
+
+describe('measureDownloadsDir (#1052)', () => {
+  it('sums bytes and counts files across nested folders', () => {
+    const root = makeRoot();
+    const a = join(root, 'Album/01 One.flac');
+    const b = join(root, 'Album/Disc 2/02 Two.flac');
+    mkdirSync(join(a, '..'), { recursive: true });
+    mkdirSync(join(b, '..'), { recursive: true });
+    writeFileSync(a, '12345'); // 5 bytes
+    writeFileSync(b, '1234567'); // 7 bytes
+
+    expect(measureDownloadsDir(root)).toEqual({ bytes: 12, files: 2 });
+  });
+
+  it('reports zero for a directory that does not exist yet', () => {
+    expect(measureDownloadsDir(join(tmpdir(), 'addon-retention-never-created'))).toEqual({
+      bytes: 0,
+      files: 0,
+    });
   });
 });

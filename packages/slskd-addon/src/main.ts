@@ -7,7 +7,7 @@ import { AlbumHunterService } from './services/album-hunter.service.js';
 import { TrackHunterService } from './services/track-hunter.service.js';
 import { AlbumFallbackService } from './services/album-fallback.service.js';
 import { SearchLanes } from './services/search-lanes.js';
-import { DownloadRetentionService } from './services/download-retention.service.js';
+import { DownloadRetentionService, measureDownloadsDir } from './services/download-retention.service.js';
 import { DownloadRetryService } from './services/download-retry.service.js';
 import { makeAddonFallbackHost } from './services/addon-fallback-host.js';
 import { SourceConnection } from './services/source-connection.js';
@@ -107,7 +107,7 @@ async function statusRows(): Promise<AddonStatusRow[]> {
     appInfo,
   });
   const mb = (bytes: number) => `${(bytes / 1_000_000).toFixed(2)} MB/s`;
-  return [
+  const rows: AddonStatusRow[] = [
     {
       key: 'connection',
       label: 'Connection',
@@ -118,6 +118,16 @@ async function statusRows(): Promise<AddonStatusRow[]> {
     { key: 'downloading', label: 'Downloading', value: String(status.counts.downloading) },
     { key: 'queued', label: 'Queued', value: String(status.counts.queued) },
   ];
+  // Surface the retention backstop's own target, so "is it worth turning on"
+  // is a glance here rather than a shell into the host (NicotinD#1052).
+  try {
+    const { bytes, files } = measureDownloadsDir(config.downloadsDir);
+    const gb = (bytes / 1_000_000_000).toFixed(2);
+    rows.push({ key: 'downloadsStaging', label: 'Downloads staging', value: `${gb} GB · ${files} files` });
+  } catch {
+    /* status is best-effort */
+  }
+  return rows;
 }
 
 const app = createAddonApp({
