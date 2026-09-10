@@ -835,3 +835,106 @@ describe('AlbumFallbackService — concurrent-peer fan-out (#264)', () => {
     expect(enqueued).not.toContain('Alt3Album/02 Song Two.flac');
   });
 });
+
+describe('AlbumFallbackService — offline peers and ownerless jobs (#15)', () => {
+  let db: Database;
+  beforeEach(() => {
+    db = makeDb();
+  });
+
+  const PRIMARY_GAVE_UP = [
+    {
+      username: 'primary',
+      directory: 'Album',
+      files: [
+        { id: 'p1', filename: 'Album/01 Song One.flac', size: 1, state: 'Completed, Succeeded' },
+        { id: 'p2', filename: 'Album/02 Song Two.flac', size: 1, state: 'Completed, Errored' },
+        { id: 'p3', filename: 'Album/03 Song Three.flac', size: 1, state: 'Completed, Errored' },
+      ],
+    },
+  ];
+  const ALT2: AlternateCandidate = {
+    username: 'alt2',
+    directory: 'Alt2Album',
+    files: [
+      { filename: 'Alt2Album/02 Song Two.flac', size: 1 },
+      { filename: 'Alt2Album/03 Song Three.flac', size: 1 },
+    ],
+  };
+
+  function primaryGaveUp() {
+    db.run(
+      `INSERT INTO transfer_retries (transfer_key, username, filename, attempts, gave_up) VALUES
+       ('primary::Album/02 Song Two.flac', 'primary', 'x', 3, 1),
+       ('primary::Album/03 Song Three.flac', 'primary', 'x', 3, 1)`,
+    );
+  }
+
+  function alternates(): string[] {
+    const row = db.query('SELECT alternates_json AS a FROM album_jobs WHERE id = 1').get() as {
+      a: string;
+    };
+    return (JSON.parse(row.a) as AlternateCandidate[]).map((a) => a.username);
+  }
+
+  it('a refused alternate is consumed, so the next sweep reaches the next peer', async () => {
+    const { slskd, enqueue } = makeSlskd(PRIMARY_GAVE_UP);
+    // slskd answers a peer that is offline with a 500 (`UserOfflineException`);
+    // on kpc this was retried against the same peer every 15 s, 6,344 times.
+    enqueue.mockImplementation(async (username: string) => {
+      if (username === 'alt') throw new Error('slskd request failed: 500 /transfers/downloads/alt');
+    });
+    primaryGaveUp();
+    recordJob(db, [ALT, ALT2]);
+
+    const svc = new AlbumFallbackService(slskd, { db, host: NOOP_FALLBACK_HOST });
+    await svc.sweep();
+    expect(enqueue.mock.calls.map((c) => c[0])).toEqual(['alt']);
+    expect(attempts(db)).toBe(1);
+    expect(alternates()).toEqual(['alt2']);
+
+    await svc.sweep();
+    expect(enqueue.mock.calls.map((c) => c[0])).toEqual(['alt', 'alt2']);
+    expect(jobState(db)).toBe('active');
+  });
+
+  it('spends nothing while the source itself is offline', async () => {
+    const { slskd, enqueue } = makeSlskd(PRIMARY_GAVE_UP);
+    enqueue.mockImplementation(async () => {
+      throw new Error('slskd request failed: 500 /transfers/downloads/alt');
+    });
+    primaryGaveUp();
+    recordJob(db, [ALT, ALT2]);
+
+    const svc = new AlbumFallbackService(slskd, {
+      db,
+      host: NOOP_FALLBACK_HOST,
+      isSourceReady: async () => false,
+    });
+    await svc.sweep();
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(attempts(db)).toBe(0);
+    expect(alternates()).toEqual(['alt', 'alt2']);
+  });
+
+  it('an album job nobody owns is abandoned instead of swept for ever', async () => {
+    const { slskd, enqueue } = makeSlskd(PRIMARY_GAVE_UP);
+    primaryGaveUp();
+    recordJob(db, [ALT]);
+
+    const svc = new AlbumFallbackService(slskd, {
+      db,
+      host: { ...NOOP_FALLBACK_HOST, hasOwner: () => false },
+      autoRetryExhausted: true,
+      exhaustedRetryCooldownMs: 0,
+    });
+    await svc.sweep();
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(jobState(db)).toBe('abandoned');
+
+    // Not a state the reviver brings back.
+    await svc.sweep();
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(jobState(db)).toBe('abandoned');
+  });
+});

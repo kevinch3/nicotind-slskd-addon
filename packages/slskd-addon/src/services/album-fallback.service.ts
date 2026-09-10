@@ -30,6 +30,13 @@ export interface FallbackHost {
    * suppression (without it a revival re-downloads the whole album).
    */
   onDiskTitles(job: { artistName: string | null; albumTitle: string | null }): string[];
+  /**
+   * Does a unified job still own this album job? Absent means "always". The
+   * host deletes its job once every wanted track is in (or a person removed
+   * it); an album job that keeps sweeping after that is hunting tracks nobody
+   * will ingest (#15).
+   */
+  hasOwner?(albumJobId: number): boolean;
 }
 
 /** For hosts with nothing to sync (addon-standalone tests). */
@@ -157,6 +164,12 @@ export interface AlbumFallbackOptions {
   stallThresholdMs?: number;
   /** Injectable clock for deterministic stall tests. */
   now?: () => number;
+  /**
+   * Is the Soulseek session logged in? While it is not, every enqueue fails
+   * for a reason that is not the peer's, so the sweep spends nothing. Absent
+   * means "always ready" (#15).
+   */
+  isSourceReady?: () => Promise<boolean>;
 }
 
 /**
@@ -175,6 +188,7 @@ export class AlbumFallbackService {
   private exhaustedMaxRevives: number;
   private stallThresholdMs: number;
   private now: () => number;
+  private isSourceReady: (() => Promise<boolean>) | null;
   /**
    * Per-transfer byte-progress watermarks, keyed `${username}::${filename}`.
    * In-memory on purpose: a restart resets the stall clock, which only makes
@@ -193,6 +207,7 @@ export class AlbumFallbackService {
     this.exhaustedMaxRevives = options.exhaustedMaxRevives ?? 5;
     this.stallThresholdMs = options.stallThresholdMs ?? 120_000;
     this.now = options.now ?? Date.now;
+    this.isSourceReady = options.isSourceReady ?? null;
   }
 
   /**
@@ -233,6 +248,15 @@ export class AlbumFallbackService {
       )
       .all() as AlbumJobRow[];
     if (!jobs.length) return;
+
+    // An enqueue refused while the session is logged out says nothing about
+    // the peer, so it must cost nothing; once logged in, a refusal is the
+    // peer's verdict and is spent below. slskd's HTTP API answers either way,
+    // which is why `getDownloads` succeeding is not the check (#1040).
+    if (this.isSourceReady && !(await this.isSourceReady())) {
+      log.debug('source offline — fallback sweep skipped');
+      return;
+    }
 
     let downloads;
     try {
@@ -275,6 +299,14 @@ export class AlbumFallbackService {
     }
 
     for (const job of jobs) {
+      // Nobody will ingest what this job recovers: the host released (or a
+      // person removed) the unified job. On kpc one such row swept for days,
+      // and would have pulled 23 files the moment its offline peer returned.
+      if (this.host.hasOwner && !this.host.hasOwner(job.id)) {
+        log.info({ jobId: job.id }, 'No unified job owns this album job — abandoning it');
+        this.setState(job.id, 'abandoned');
+        continue;
+      }
       // Recovery target = the chosen folder's own manifest (normalized track
       // titles), falling back to the canonical Lidarr tracklist only for legacy
       // jobs recorded before the manifest was persisted. Targeting the manifest
@@ -326,7 +358,19 @@ export class AlbumFallbackService {
         try {
           await this.slskd.transfers.enqueue(picked.alternate.username, picked.files);
         } catch (err) {
-          log.warn({ jobId: job.id, err }, 'Fallback enqueue failed; will retry next sweep');
+          // The peer refused (typically offline). `pickAlternate` is
+          // deterministic, so leaving the alternate in place retried the same
+          // dead peer every sweep for ever — 6,344 times in 36 h on kpc (#15).
+          // Consume it and spend the attempt: the next sweep reaches the next
+          // peer, and a job with only dead peers still exhausts.
+          log.warn(
+            { jobId: job.id, from: picked.alternate.username, err },
+            'Alternate refused the enqueue; moving on to the next peer',
+          );
+          this.db.run(
+            'UPDATE album_jobs SET alternates_json = ?, fallback_attempts = fallback_attempts + 1 WHERE id = ?',
+            [JSON.stringify(alternates.filter((a) => a !== picked.alternate)), job.id],
+          );
           continue;
         }
 
