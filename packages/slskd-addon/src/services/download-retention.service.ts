@@ -9,6 +9,12 @@ const log = createLogger('download-retention');
 
 const DEFAULT_INTERVAL_MS = 60 * 60 * 1000;
 const DEFAULT_RETENTION_DAYS = 7;
+// The threshold that turns silent accumulation into a log line while the
+// sweep is off — not a decision to reclaim anything. kpc already lost
+// services once to a full Docker disk with no warning (#1021); a sweep that
+// must be switched on by an operator who means to (see `daysFrom` in
+// config.ts) is still worth watching passively while it isn't.
+const DEFAULT_WARN_BYTES = 10_000_000_000;
 
 export interface DownloadRetentionOptions {
   db: Database;
@@ -74,7 +80,20 @@ export class DownloadRetentionService {
     const empty = { removed: 0, bytes: 0 };
     if (this.sweeping) return empty;
     const days = this.retentionDays();
-    if (!Number.isFinite(days) || days <= 0) return empty;
+    if (!Number.isFinite(days) || days <= 0) {
+      // Disabled is a legitimate, deliberate choice (config.ts) — but nothing
+      // else on this schedule ever looks at the directory, so a disabled sweep
+      // was previously a directory that could grow without bound and without
+      // one log line about it (NicotinD#1052). This adds the look, not a sweep.
+      const { bytes, files } = measureDownloadsDir(this.downloadsDir());
+      if (bytes >= DEFAULT_WARN_BYTES) {
+        log.warn(
+          { bytes, files },
+          'downloads staging directory is large and the retention sweep is disabled — see NicotinD#1052',
+        );
+      }
+      return empty;
+    }
 
     this.sweeping = true;
     try {
@@ -251,4 +270,23 @@ function walkFiles(dir: string): string[] {
   return entries.flatMap((e) =>
     e.isDirectory() ? walkFiles(join(dir, e.name)) : [join(dir, e.name)],
   );
+}
+
+/**
+ * Total size and file count of the downloads staging dir, for the WARN above
+ * and for a status row (NicotinD#1052) — a cheap `readdirSync`/`statSync` walk,
+ * not a sweep: it never touches the ledger or unlinks anything.
+ */
+export function measureDownloadsDir(root: string): { bytes: number; files: number } {
+  let bytes = 0;
+  let files = 0;
+  for (const abs of walkFiles(root)) {
+    try {
+      bytes += statSync(abs).size;
+      files += 1;
+    } catch {
+      /* raced with a delete; the count is a report, not a ledger */
+    }
+  }
+  return { bytes, files };
 }
