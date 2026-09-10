@@ -10,6 +10,7 @@ import { SearchLanes } from './services/search-lanes.js';
 import { DownloadRetentionService } from './services/download-retention.service.js';
 import { DownloadRetryService } from './services/download-retry.service.js';
 import { makeAddonFallbackHost } from './services/addon-fallback-host.js';
+import { SourceConnection } from './services/source-connection.js';
 import { TransferPoller } from './services/transfer-poller.js';
 import { markItemsCompletedByTransfer } from './services/job-store.js';
 import { buildSlskdStatus } from './services/slskd-status.js';
@@ -39,6 +40,10 @@ const slskdRef = { current: makeSlskd() };
 // (hunt, track hunt, fallback wave) takes its turn here (#1049).
 const lanes = new SearchLanes();
 
+// One view of "is Soulseek logged in" for the health probe and the fallback
+// sweep alike — the same question, and the same throttled reconnect nudge.
+const sourceConnection = new SourceConnection(slskdRef);
+
 // Hunt/fallback/retry engine over the addon's own tables. The fallback host
 // mirrors wave events onto the protocol job ledger the core host polls.
 const fallback = new AlbumFallbackService(slskdRef.current, {
@@ -46,6 +51,7 @@ const fallback = new AlbumFallbackService(slskdRef.current, {
   lanes,
   host: makeAddonFallbackHost(db),
   autoRetryExhausted: true,
+  isSourceReady: () => sourceConnection.isReady(),
 });
 const retry = new DownloadRetryService(slskdRef.current, {
   db,
@@ -117,6 +123,7 @@ async function statusRows(): Promise<AddonStatusRow[]> {
 const app = createAddonApp({
   db,
   slskdRef,
+  sourceConnection,
   token: config.token,
   statusRows,
   onConfigChanged: () => {

@@ -54,6 +54,10 @@ export function makeAddonFallbackHost(db: Database): FallbackHost {
     onDiskTitles() {
       return [];
     },
+
+    hasOwner(albumJobId) {
+      return addonJobIdForAlbumJob(db, albumJobId) !== null;
+    },
   };
 }
 
