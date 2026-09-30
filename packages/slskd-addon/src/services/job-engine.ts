@@ -2,8 +2,7 @@ import type { Database } from 'bun:sqlite';
 import { randomUUID } from 'node:crypto';
 import {
   createLogger,
-  normalizeTitle,
-  titlesOverlap,
+  matchFilesToTitles,
   type AddonAlbumCandidate,
   type AddonJobRequest,
 } from '@nicotind/addon-sdk';
@@ -104,7 +103,14 @@ async function executeAlbumJob(deps: JobEngineDeps, req: AddonJobRequest): Promi
   // Scope the enqueue to the wanted tracks (the host's missing-on-disk subset)
   // — the #262 discipline: a whole-discography dump folder must never enqueue
   // beyond the album, and already-owned tracks are never re-pulled.
-  const files = wanted.length ? filesMatchingTitles(best.files, wanted) : best.files;
+  // Matched against the album's whole tracklist, so a file that is really an
+  // owned neighbouring track ("Arpeggiator Stories Continued" for "Arpeggiator
+  // Stories") is never taken for the wanted one (NicotinD#1468).
+  const matches = wanted.length
+    ? matchFilesToTitles(best.files, wanted, canonicalTracks.map((t) => t.title))
+    : [];
+  const files = wanted.length ? matches.map((m) => m.file) : best.files;
+  const titleOf = new Map(matches.map((m) => [m.file.filename, m.title]));
   if (!files.length)
     throw new JobRequestError('the picked folder covers none of the wanted tracks');
 
@@ -140,7 +146,7 @@ async function executeAlbumJob(deps: JobEngineDeps, req: AddonJobRequest): Promi
     db,
     jobId,
     files.map((f): NewJobItem => {
-      const title = titleForFile(f.filename, wanted);
+      const title = titleOf.get(f.filename) ?? null;
       return {
         itemId: title ? itemIdForTitle(title) : itemIdForFile(f.filename),
         title,
@@ -207,28 +213,11 @@ async function executeBrowseGrab(deps: JobEngineDeps, req: AddonJobRequest): Pro
   return jobId;
 }
 
-/** Files whose normalized basename overlaps any wanted title (pickAlternate's rule). */
-export function filesMatchingTitles<T extends { filename: string }>(
-  files: T[],
-  titles: string[],
-): T[] {
-  const normalized = titles.map(normalizeTitle);
-  return files.filter((f) => {
-    const base = normalizeBasename(f.filename);
-    return normalized.some((t) => titlesOverlap(t, base));
-  });
-}
-
-function titleForFile(filename: string, titles: string[]): string | null {
-  const base = normalizeBasename(filename);
-  return titles.find((t) => titlesOverlap(normalizeTitle(t), base)) ?? null;
-}
-
-function normalizeBasename(filename: string): string {
-  const base = filename.replace(/\\/g, '/').split('/').pop() ?? filename;
-  const noExt = base.slice(0, base.lastIndexOf('.') || base.length);
-  return normalizeTitle(noExt);
-}
+/**
+ * The files of a folder that carry a wanted title — the SDK's rule, re-exported
+ * where this module has always offered it.
+ */
+export { filesMatchingTitles } from '@nicotind/addon-sdk';
 
 /** Mint the response candidates + a TTL-bound ref map for later job requests. */
 export function candidateCache(ttlMs = 15 * 60_000) {
