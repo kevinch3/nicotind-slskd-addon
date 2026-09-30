@@ -179,6 +179,73 @@ describe('addon protocol routes', () => {
     expect(body.candidates).toEqual([]);
   });
 
+  // NicotinD#1468, the real 2026-09-29 Eelke Kleijn case: "Arpeggiator Stories
+  // Continued" carries every word of the wanted "Arpeggiator Stories", but it is
+  // the album's own (owned) track 4 — never the wanted track 3.
+  describe('a missing-track job takes the wanted title, not a longer neighbour', () => {
+    const canonicalTracks = [
+      { title: 'Harpy' },
+      { title: 'Arpeggiator Stories' },
+      { title: 'Arpeggiator Stories Continued' },
+    ];
+    function folder(filenames: string[]) {
+      (h.slskdRef.current.searches as { getResponses: unknown }).getResponses = async () => [
+        {
+          username: 'goodpeer',
+          freeUploadSlots: 1,
+          queueLength: 0,
+          uploadSpeed: 100,
+          files: filenames.map((filename) => ({ filename, size: 1000, bitRate: 320 })),
+        },
+      ];
+    }
+    async function jobFor() {
+      const search = await h.app.request(
+        '/addon/v1/albums/search',
+        json({ artist: 'Eelke Kleijn', album: 'Untold Stories', canonicalTracks }),
+      );
+      const { candidates } = (await search.json()) as AddonAlbumSearchResponse;
+      return h.app.request(
+        '/addon/v1/jobs',
+        json({
+          intent: 'album',
+          artist: 'Eelke Kleijn',
+          album: 'Untold Stories',
+          canonicalTracks,
+          wantedTracks: [{ title: 'Arpeggiator Stories' }],
+          candidateRef: candidates[0]!.candidateRef,
+        }),
+      );
+    }
+
+    it('refuses a folder whose only overlapping file is the neighbour', async () => {
+      folder([
+        'Music\\Untold Stories\\01 - Eelke Kleijn - Harpy.mp3',
+        'Music\\Untold Stories\\04 - Eelke Kleijn - Arpeggiator Stories Continued.mp3',
+      ]);
+      const res = await jobFor();
+      expect(res.status).toBe(400);
+      expect(h.state.enqueued).toHaveLength(0);
+    });
+
+    it('enqueues only the wanted file when the folder carries both', async () => {
+      folder([
+        'Music\\Untold Stories\\01 - Eelke Kleijn - Harpy.mp3',
+        'Music\\Untold Stories\\03 - Eelke Kleijn - Arpeggiator Stories.mp3',
+        'Music\\Untold Stories\\04 - Eelke Kleijn - Arpeggiator Stories Continued.mp3',
+      ]);
+      const res = await jobFor();
+      expect(res.status).toBe(201);
+      const { job } = (await res.json()) as { job: AddonJob };
+      expect(h.state.enqueued[0]!.files).toEqual([
+        expect.objectContaining({
+          filename: 'Music\\Untold Stories\\03 - Eelke Kleijn - Arpeggiator Stories.mp3',
+        }),
+      ]);
+      expect(job.items.map((i) => i.itemId)).toEqual(['t:arpeggiator stories']);
+    });
+  });
+
   it('runs the album job loop: candidateRef → enqueue → items → completion → file fetch', async () => {
     const search = await h.app.request(
       '/addon/v1/albums/search',

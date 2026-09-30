@@ -22,6 +22,10 @@ A self-contained [Bun](https://bun.com) workspace:
 > builds standalone today. Once it is published to npm, `slskd-addon`/`slskd-client` can depend on
 > the published `@nicotind/addon-sdk` and drop the vendored copy — a two-line change to their
 > `package.json` deps plus removing `packages/addon-sdk`.
+>
+> Until then, keep the vendored copy's `title-match.ts` (and its test) byte-identical to NicotinD's
+> `packages/addon-sdk/src/title-match.ts` — the host skips a folder by the same rule this addon
+> scopes an album job with (NicotinD#1209, #1468).
 
 The published protocol contract lives in [`docs/addon-protocol/v1.md`](docs/addon-protocol/v1.md)
 (+ generated `docs/addon-protocol/v1/schema.json`, regenerate with `bun run gen:schema`).
