@@ -84,23 +84,102 @@ describe('filesMatchingTitles (the slskd addon coverage rule, #1209)', () => {
 // hunt downloaded, with the album's canonical tracklist. The first three are
 // neighbouring tracks the album already owned; the old one-sided rule (70% of
 // the WANTED words present) took all three.
-const UNTOLD_STORIES = ['Ortni', 'Violintermezzo', 'Arpeggiator Stories', 'Arpeggiator Stories Continued', 'Harpy'];
-const LO_MEJOR_DE = ['Separate', 'Profundo valor', 'Caradura', 'Dime la verdad', 'De mujer a mujer'];
-const SPINETTALANDIA = ['Dame, dame pan', 'Estrella', 'La búsqueda de la estrella', 'Vamos al bosque'];
-const EL_MADRILENO = ['Nominao', 'Te olvidaste', 'Los tontos', 'Yate', "Los tontos (Live at NPR's Tiny Desk)", 'Para repartir'];
+const UNTOLD_STORIES = [
+  'Ortni',
+  'Violintermezzo',
+  'Arpeggiator Stories',
+  'Arpeggiator Stories Continued',
+  'Harpy',
+];
+const LO_MEJOR_DE = [
+  'Separate',
+  'Profundo valor',
+  'Caradura',
+  'Dime la verdad',
+  'De mujer a mujer',
+];
+const SPINETTALANDIA = [
+  'Dame, dame pan',
+  'Estrella',
+  'La búsqueda de la estrella',
+  'Vamos al bosque',
+];
+const EL_MADRILENO = [
+  'Nominao',
+  'Te olvidaste',
+  'Los tontos',
+  'Yate',
+  "Los tontos (Live at NPR's Tiny Desk)",
+  'Para repartir',
+];
 
 const PASS_2026_09_29: Array<[string, string, string[], boolean]> = [
-  ['Arpeggiator Stories', 'Untold Stories (2010)/04 - Eelke Kleijn - Arpeggiator Stories Continued.mp3', UNTOLD_STORIES, false],
-  ['De mujer a mujer', 'Lo Mejor De Marta Sánchez/17 De Mujer A Mujer, Profundo Valor.mp3', LO_MEJOR_DE, false],
-  ['Estrella', '1971 - Spinettalandia/06 - Luis Alberto Spinetta - Spinettalandia y sus amigos - La búsqueda de la estrella.flac', SPINETTALANDIA, false],
-  ['Sexy Dance', '(Mp3-Album) Paulina Rubio - Paulina (2000)/07 Paulina Rubio - Sexy Dance.mp3', ['Sin aire', 'Sexy Dance'], true],
-  ['Besos perdidos (Manhã de Carnaval)', '(2006) Club Atlético Decadente/14. Besos perdidos (Manhã de Carnaval) [3m47s][320 44100KHz CBR 2ch].mp3', ['Somos', 'Besos perdidos (Manhã de Carnaval)'], true],
-  ['Molotov Coktail Party', '¿Dónde jugarán las niñas! (1997)/Molotov - 02 - Molotov Coktail Party.flac', ['Voto latino', 'Molotov Coktail Party', 'Voto latino (remix)'], true],
-  ['Cristo es Marquitos Di Palma', 'Ruli (2013)/10 - Cristo es Marquitos Di Palma.flac', ['La 13', 'Cristo es Marquitos Di Palma'], true],
-  ['The Weekend', 'Analog Is On (2007)/01 - The Weekend.flac', ['The Weekend', 'The Asteroid'], true],
-  ['Nominao', 'C. Tangana - El Madrileño (2022)/07 - Nominao Feat. Jorge Drexler.flac', EL_MADRILENO, true],
-  ['Te olvidaste', 'C. Tangana - El Madrileño (2022)/09 - Te Olvidaste Feat. Omar Apollo.flac', EL_MADRILENO, true],
-  ['Los tontos', "C. Tangana - El Madrileño (2022)/21 - Los Tontos Feat. Kiko Veneno (Live At Npr's Tiny Desk).flac", EL_MADRILENO, false],
+  [
+    'Arpeggiator Stories',
+    'Untold Stories (2010)/04 - Eelke Kleijn - Arpeggiator Stories Continued.mp3',
+    UNTOLD_STORIES,
+    false,
+  ],
+  [
+    'De mujer a mujer',
+    'Lo Mejor De Marta Sánchez/17 De Mujer A Mujer, Profundo Valor.mp3',
+    LO_MEJOR_DE,
+    false,
+  ],
+  [
+    'Estrella',
+    '1971 - Spinettalandia/06 - Luis Alberto Spinetta - Spinettalandia y sus amigos - La búsqueda de la estrella.flac',
+    SPINETTALANDIA,
+    false,
+  ],
+  [
+    'Sexy Dance',
+    '(Mp3-Album) Paulina Rubio - Paulina (2000)/07 Paulina Rubio - Sexy Dance.mp3',
+    ['Sin aire', 'Sexy Dance'],
+    true,
+  ],
+  [
+    'Besos perdidos (Manhã de Carnaval)',
+    '(2006) Club Atlético Decadente/14. Besos perdidos (Manhã de Carnaval) [3m47s][320 44100KHz CBR 2ch].mp3',
+    ['Somos', 'Besos perdidos (Manhã de Carnaval)'],
+    true,
+  ],
+  [
+    'Molotov Coktail Party',
+    '¿Dónde jugarán las niñas! (1997)/Molotov - 02 - Molotov Coktail Party.flac',
+    ['Voto latino', 'Molotov Coktail Party', 'Voto latino (remix)'],
+    true,
+  ],
+  [
+    'Cristo es Marquitos Di Palma',
+    'Ruli (2013)/10 - Cristo es Marquitos Di Palma.flac',
+    ['La 13', 'Cristo es Marquitos Di Palma'],
+    true,
+  ],
+  [
+    'The Weekend',
+    'Analog Is On (2007)/01 - The Weekend.flac',
+    ['The Weekend', 'The Asteroid'],
+    true,
+  ],
+  [
+    'Nominao',
+    'C. Tangana - El Madrileño (2022)/07 - Nominao Feat. Jorge Drexler.flac',
+    EL_MADRILENO,
+    true,
+  ],
+  [
+    'Te olvidaste',
+    'C. Tangana - El Madrileño (2022)/09 - Te Olvidaste Feat. Omar Apollo.flac',
+    EL_MADRILENO,
+    true,
+  ],
+  [
+    'Los tontos',
+    "C. Tangana - El Madrileño (2022)/21 - Los Tontos Feat. Kiko Veneno (Live At Npr's Tiny Desk).flac",
+    EL_MADRILENO,
+    false,
+  ],
   ['Para repartir', 'C. Tangana - El Madrileño (2022)/23 - Para Repartir.flac', EL_MADRILENO, true],
 ];
 
@@ -127,7 +206,9 @@ describe('matchFilesToTitles (#1468: a longer, different title is another track)
       { filename: 'Untold Stories/03 - Eelke Kleijn - Arpeggiator Stories (Radio Edit).mp3' },
       { filename: 'Untold Stories/04 - Eelke Kleijn - Arpeggiator Stories Continued.mp3' },
     ];
-    expect(filesMatchingTitles(folder, ['Arpeggiator Stories'], UNTOLD_STORIES)).toEqual([folder[0]]);
+    expect(filesMatchingTitles(folder, ['Arpeggiator Stories'], UNTOLD_STORIES)).toEqual([
+      folder[0],
+    ]);
   });
 
   it('assigns a file to the album track it matches best, taking it only for a wanted one', () => {
