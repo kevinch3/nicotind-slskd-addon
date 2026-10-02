@@ -1,4 +1,11 @@
-import { createLogger, normalizeTitle, titlesOverlap } from '@nicotind/addon-sdk';
+import {
+  createLogger,
+  fileTitleScore,
+  filesMatchingTitles,
+  matchFilesToTitles,
+  normalizeTitle,
+  titlesMissingFromOwned,
+} from '@nicotind/addon-sdk';
 import type { Slskd } from '@nicotind/slskd-client';
 import type { Database } from 'bun:sqlite';
 
@@ -314,16 +321,15 @@ export class AlbumFallbackService {
       // the canonical list can be a deluxe edition whose extra cuts no single
       // folder contains, so chasing it dumps duplicate rips into the album.
       const targets = parseTargets(job);
+      // The whole tracklist, so a delivered neighbour ("X Continued") counts
+      // toward its own track and never as the missing "X" (NicotinD#1472).
+      const canonical = JSON.parse(job.canonical_tracks_json) as string[];
       // A track is satisfied if a peer just delivered it (`succeeded`) OR it is
       // already in the library on disk. The on-disk check is essential for
       // *revived* jobs: their original slskd transfers are long gone from
       // getDownloads, so without it the sweep would re-download the whole album.
       const onDisk = this.libraryTitlesForJob(job);
-      const missing = targets.filter(
-        (title) =>
-          !succeeded.some((s) => titlesOverlap(title, s)) &&
-          !onDisk.some((s) => titlesOverlap(title, s)),
-      );
+      const missing = unownedTargets(targets, canonical, [...succeeded, ...onDisk]);
 
       if (!missing.length) {
         this.setState(job.id, 'done');
@@ -336,7 +342,8 @@ export class AlbumFallbackService {
       // whether the job is done); `recoverable` is what a fallback may act on.
       // This is also the concurrency cap — a wave cannot start while a previous
       // wave is still moving bytes for the same titles.
-      const recoverable = missing.filter((m) => !inFlight.some((s) => titlesOverlap(m, s)));
+      const notInFlight = new Set(unownedTargets(targets, canonical, inFlight));
+      const recoverable = missing.filter((m) => notInFlight.has(m));
       // Everything still outstanding is in flight: wait rather than burning a
       // fallback attempt on a duplicate pull.
       if (!recoverable.length) continue;
@@ -350,7 +357,7 @@ export class AlbumFallbackService {
       }
 
       const alternates = JSON.parse(job.alternates_json) as AlternateCandidate[];
-      const picked = pickAlternate(alternates, recoverable);
+      const picked = pickAlternate(alternates, recoverable, canonical);
 
       // Cheapest path first: pull from a recorded alternate folder if one covers
       // a missing track. Only when none does do we pay for a fresh network search.
@@ -388,6 +395,7 @@ export class AlbumFallbackService {
           picked.alternate.username,
           picked.files.map((f) => ({ filename: f.filename, bitRate: f.bitRate })),
           recoverable,
+          canonical,
           picked.alternate.audioFormat,
         );
 
@@ -409,7 +417,12 @@ export class AlbumFallbackService {
 
       // Fresh per-track search across all peers. `recoverable` already excludes
       // tracks a previous wave is still pulling.
-      const enqueued = await this.recoverViaFreshSearch(job.id, job.artist_name, recoverable);
+      const enqueued = await this.recoverViaFreshSearch(
+        job.id,
+        job.artist_name,
+        recoverable,
+        canonical,
+      );
       // Count the wave as an attempt either way so a hopeless gap eventually
       // exhausts instead of re-searching forever.
       this.db.run('UPDATE album_jobs SET fallback_attempts = fallback_attempts + 1 WHERE id = ?', [
@@ -436,9 +449,10 @@ export class AlbumFallbackService {
     albumJobId: number,
     artistName: string,
     missing: string[],
+    canonical: string[],
   ): Promise<number> {
     const picks = await Promise.all(
-      missing.map((title) => this.searchBestForTrack(artistName, title)),
+      missing.map((title) => this.searchBestForTrack(artistName, title, canonical)),
     );
 
     // Group the chosen files by peer, de-duping identical filenames. Keep the
@@ -467,6 +481,7 @@ export class AlbumFallbackService {
         username,
         files.map((f) => ({ filename: f.filename, bitRate: f.bitRate })),
         files.map((f) => titleForFilename.get(f.filename) ?? normalizeBasename(f.filename)),
+        canonical,
       );
     }
     return enqueued;
@@ -475,7 +490,7 @@ export class AlbumFallbackService {
   /**
    * Point the unified acquisition job's items at the transfers a fallback wave
    * just enqueued. Each filename is matched to the missing title it recovers
-   * (fuzzy, same titlesOverlap the wave selection used). `audioFormat` is the
+   * (the same `matchFilesToTitles` rule the wave selection used). `audioFormat` is the
    * folder-level codec (FLAC/MP3/…) carried by the alternate; per-file bitrates
    * come in alongside each filename so the repointed item's quality info
    * reflects the alternate peer, not the original. Best-effort: a repoint
@@ -486,18 +501,18 @@ export class AlbumFallbackService {
     username: string,
     files: Array<{ filename: string; bitRate?: number }>,
     missingTitles: string[],
+    canonical: string[],
     audioFormat?: string,
   ): void {
     try {
       // Resolving which missing title each file recovers is fallback domain
-      // knowledge (same fuzzy overlap the wave selection used); applying the
-      // repoint to the unified job ledger is the host's.
+      // knowledge (the rule the wave selection used); applying the repoint to
+      // the unified job ledger is the host's.
+      const assigned = new Map(
+        matchFilesToTitles(files, missingTitles, canonical).map((m) => [m.file.filename, m.title]),
+      );
       const items = files.map(({ filename, bitRate }) => {
-        const base = normalizeBasename(filename);
-        const title =
-          missingTitles.find((t) => titlesOverlap(t, base)) ??
-          missingTitles.find((t) => titlesOverlap(normalizeTitle(t), base)) ??
-          base;
+        const title = assigned.get(filename) ?? normalizeBasename(filename);
         return { title, filename, bitRate };
       });
       this.host.repointItems(albumJobId, username, items, audioFormat);
@@ -510,16 +525,18 @@ export class AlbumFallbackService {
   private async searchBestForTrack(
     artistName: string,
     title: string,
+    canonical: string[],
   ): Promise<{
     username: string;
     file: { filename: string; size: number; bitRate?: number };
   } | null> {
-    return this.lanes.run('background', () => this.freshSearch(artistName, title));
+    return this.lanes.run('background', () => this.freshSearch(artistName, title, canonical));
   }
 
   private async freshSearch(
     artistName: string,
     title: string,
+    canonical: string[],
   ): Promise<{
     username: string;
     file: { filename: string; size: number; bitRate?: number };
@@ -558,7 +575,8 @@ export class AlbumFallbackService {
           const ext = file.filename.slice(file.filename.lastIndexOf('.')).toLowerCase();
           if (!AUDIO_EXTENSIONS.has(ext)) continue;
           const normFile = normalizeBasename(file.filename);
-          if (!titlesOverlap(normTitle, normFile)) continue;
+          if (!fileTitleScore(title, file.filename)) continue;
+          if (!filesMatchingTitles([file], [title], canonical).length) continue;
 
           // Cleanliness dominates: the file with the fewest extra words beyond the
           // canonical title wins, so we recover "Bohemian Rhapsody" — never the
@@ -702,6 +720,16 @@ export class AlbumFallbackService {
  * job is done. Prefers the primary folder's manifest (`target_files_json`); for
  * legacy jobs recorded without it, falls back to the canonical Lidarr titles.
  */
+/**
+ * The targets no `owned` title (a delivered, on-disk or in-flight basename)
+ * stands for. Each owned title counts toward the one track it matches best
+ * across targets AND the whole tracklist, so a neighbour is never the target.
+ */
+function unownedTargets(targets: string[], canonical: string[], owned: string[]): string[] {
+  const missing = new Set(titlesMissingFromOwned([...targets, ...canonical], owned));
+  return targets.filter((t) => missing.has(t));
+}
+
 function parseTargets(job: AlbumJobRow): string[] {
   if (job.target_files_json) {
     const files = JSON.parse(job.target_files_json) as string[];
@@ -750,16 +778,13 @@ function extraTokenCount(canonicalNorm: string, fileNorm: string): number {
 function pickAlternate(
   alternates: AlternateCandidate[],
   missing: string[],
+  canonical: string[],
 ): {
   alternate: AlternateCandidate;
   files: Array<{ filename: string; size: number; bitRate?: number }>;
 } | null {
-  const normalizedMissing = missing.map(normalizeTitle);
   for (const alternate of alternates) {
-    const files = alternate.files.filter((f) => {
-      const norm = normalizeBasename(f.filename);
-      return normalizedMissing.some((m) => titlesOverlap(m, norm));
-    });
+    const files = filesMatchingTitles(alternate.files, missing, canonical);
     if (files.length) return { alternate, files };
   }
   return null;
