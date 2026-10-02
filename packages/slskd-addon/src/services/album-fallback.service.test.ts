@@ -938,3 +938,97 @@ describe('AlbumFallbackService — offline peers and ownerless jobs (#15)', () =
     expect(jobState(db)).toBe('abandoned');
   });
 });
+
+// NicotinD#1472: the fallbacks matched a missing title one-sidedly, so a longer
+// neighbour ("Arpeggiator Stories Continued", track 4) passed for the missing
+// "Arpeggiator Stories" (track 3) — the #1468 defect on the recovery paths.
+describe('AlbumFallbackService — a neighbouring title is not the missing one (NicotinD#1472)', () => {
+  const TRACKS = ['Harpy', 'Arpeggiator Stories', 'Arpeggiator Stories Continued'];
+  let db: Database;
+  beforeEach(() => {
+    db = makeDb();
+  });
+
+  function primary(neighbour: 'Completed, Succeeded' | 'Completed, Errored') {
+    return {
+      username: 'primary',
+      directory: 'Album',
+      files: [
+        { id: 'p3', filename: 'Album/03 Arpeggiator Stories.flac', size: 1, state: 'Completed, Errored' },
+        { id: 'p4', filename: 'Album/04 Arpeggiator Stories Continued.flac', size: 1, state: neighbour },
+      ],
+    };
+  }
+
+  function record(alternates: AlternateCandidate[], artistName?: string) {
+    db.run(
+      `INSERT INTO transfer_retries (transfer_key, username, filename, attempts, gave_up) VALUES
+       ('primary::Album/03 Arpeggiator Stories.flac', 'primary', 'x', 3, 1),
+       ('primary::Album/04 Arpeggiator Stories Continued.flac', 'primary', 'x', 3, 1)`,
+    );
+    AlbumFallbackService.recordJob(db, {
+      lidarrAlbumId: 1,
+      username: 'primary',
+      directory: 'Album',
+      artistName,
+      canonicalTracks: TRACKS,
+      targetFiles: [
+        { filename: 'Album/03 Arpeggiator Stories.flac' },
+        { filename: 'Album/04 Arpeggiator Stories Continued.flac' },
+      ],
+      alternates,
+    });
+  }
+
+  it('a delivered neighbour does not satisfy the missing track', async () => {
+    const { slskd, enqueue } = makeSlskd([primary('Completed, Succeeded')]);
+    record([
+      {
+        username: 'alt',
+        directory: 'Alt',
+        files: [
+          { filename: 'Alt/03 Arpeggiator Stories.flac', size: 1 },
+          { filename: 'Alt/04 Arpeggiator Stories Continued.flac', size: 1 },
+        ],
+      },
+    ]);
+    await new AlbumFallbackService(slskd, { db, host: NOOP_FALLBACK_HOST }).sweep();
+    expect(jobState(db)).not.toBe('done');
+    expect(enqueue).toHaveBeenCalledTimes(1);
+    const [, files] = enqueue.mock.calls[0];
+    expect((files as Array<{ filename: string }>).map((f) => f.filename)).toEqual([
+      'Alt/03 Arpeggiator Stories.flac',
+    ]);
+  });
+
+  it('an alternate holding only the neighbour is not picked for the missing track', async () => {
+    const { slskd, enqueue } = makeSlskd([primary('Completed, Succeeded')]);
+    record([
+      {
+        username: 'alt',
+        directory: 'Alt',
+        files: [{ filename: 'Alt/04 Arpeggiator Stories Continued.flac', size: 1 }],
+      },
+    ]);
+    await new AlbumFallbackService(slskd, { db, host: NOOP_FALLBACK_HOST }).sweep();
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(jobState(db)).toBe('exhausted');
+  });
+
+  it('a fresh search does not take the neighbour for the missing track', async () => {
+    const { slskd, enqueue } = makeSlskdWithSearch(
+      [primary('Completed, Succeeded')],
+      [
+        {
+          username: 'freshpeer',
+          freeUploadSlots: 1,
+          files: [{ filename: 'Random/04 Arpeggiator Stories Continued.flac', size: 1 }],
+        },
+      ],
+    );
+    record([], 'Eelke Kleijn');
+    await new AlbumFallbackService(slskd, { db, host: NOOP_FALLBACK_HOST }).sweep();
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(attempts(db)).toBe(1);
+  });
+});
