@@ -182,9 +182,13 @@ export function createProtocolRoutes(deps: ProtocolRouteDeps): Hono {
     const idemKey = c.req.header('idempotency-key');
     if (idemKey) {
       const prior = idempotency.get(idemKey);
-      if (prior && prior.expires > Date.now()) {
-        return c.json({ job: getAddonJob(deps.db, prior.jobId) }, 201);
-      }
+      // Replay only a job that is still running. The key guards a lost
+      // response, not the album forever: once the job was deleted it replayed
+      // `{ job: null }` and the host 500'd on it (NicotinD#1507), and once it
+      // was cancelled it handed back a dead job as if it were a new download.
+      const replay = prior && prior.expires > Date.now() ? getAddonJob(deps.db, prior.jobId) : null;
+      if (replay?.state === 'active') return c.json({ job: replay }, 201);
+      if (prior) idempotency.delete(idemKey);
     }
 
     try {
