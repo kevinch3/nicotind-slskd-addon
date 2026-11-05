@@ -15,7 +15,10 @@ COPY packages/addon-sdk/src ./packages/addon-sdk/src
 COPY packages/slskd-client/src ./packages/slskd-client/src
 COPY packages/slskd-addon/src ./packages/slskd-addon/src
 
-ENV SLSKD_ADDON_DB=/data/slskd-addon.sqlite \
+# NODE_ENV=production makes the logger emit one JSON object per line instead
+# of pino-pretty's coloured multi-line text, so `docker logs | jq` works.
+ENV NODE_ENV=production \
+    SLSKD_ADDON_DB=/data/slskd-addon.sqlite \
     SLSKD_ADDON_DOWNLOADS_DIR=/data/downloads \
     SLSKD_ADDON_PORT=8585
 

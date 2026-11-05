@@ -152,6 +152,35 @@ describe('AlbumHunterService', () => {
       await Promise.all([first, second]);
       expect(fast.searches.create).toHaveBeenCalledTimes(2);
     });
+
+    // #24: the host gave up (its HTTP request closed). A hunt still queued must
+    // never take the lanes, and a running one must not start another wave.
+    it('a hunt aborted while queued fires no searches', async () => {
+      const lanes = new SearchLanes();
+      let releaseFirst!: () => void;
+      const hold = lanes.run('user', () => new Promise<void>((r) => (releaseFirst = r)));
+      const slskd = makeSlskdStub(FULL('Music\\Artist\\Album'));
+      const ac = new AbortController();
+      const hunt = new AlbumHunterService(slskd, undefined, lanes).hunt('Artist', 'Album', TRACKS, { signal: ac.signal });
+      await new Promise((r) => setTimeout(r, 5));
+      ac.abort();
+      await expect(hunt).rejects.toThrow();
+      releaseFirst();
+      await hold;
+      expect(slskd.searches.create).not.toHaveBeenCalled();
+    });
+
+    it('a hunt aborted after its base wave runs no skew wave', async () => {
+      const ac = new AbortController();
+      const slskd = makeQueryAwareSlskdStub({ 'Artist Album': [], 'Artist - Album': [], 'Album Artist': FULL('Music\\Artist\\Album') });
+      (slskd.searches.delete as ReturnType<typeof mock>).mockImplementation(async () => {
+        ac.abort();
+      });
+      const res = await new AlbumHunterService(slskd).hunt('Artist', 'Album', TRACKS, { skewSearch: true, signal: ac.signal });
+      const fired = (slskd.searches.create as ReturnType<typeof mock>).mock.calls.map((c) => c[0]);
+      expect(fired).toEqual(['Artist Album', 'Artist - Album']);
+      expect(res.searchesFired).toBe(2);
+    });
   });
 
   it('groups files by folder and scores match % against the tracklist', async () => {

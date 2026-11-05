@@ -360,6 +360,42 @@ export function scoreFolders(
   return candidates.slice(0, 20);
 }
 
+/**
+ * One line per hunt, whatever its outcome — the record the queue-wait and
+ * lane-hold numbers in NicotinD#1625 had to be reconstructed without.
+ * `laneWaitMs` is time queued behind other sessions; `aborted` means the
+ * caller hung up, so whatever ran was discarded.
+ */
+function logHuntSummary(
+  artist: string,
+  album: string,
+  queuedAt: number,
+  trace: { startedAt: number | null; waves: number; result: HuntResult | null },
+  opts: { signal?: AbortSignal; attemptId?: string },
+): void {
+  const now = Date.now();
+  const r = trace.result;
+  log.info(
+    {
+      ...(opts.attemptId ? { attemptId: opts.attemptId } : {}),
+      artist,
+      album,
+      laneWaitMs: (trace.startedAt ?? now) - queuedAt,
+      durationMs: now - queuedAt,
+      waves: trace.waves,
+      queries: r?.queries ?? [],
+      fired: r?.searchesFired ?? 0,
+      answered: r?.searchesAnswered ?? 0,
+      candidates: r?.candidates.length ?? 0,
+      bestMatchPct: r?.candidates[0]?.matchPct ?? 0,
+      rateLimited: r?.rateLimited ?? false,
+      sourceOffline: r?.sourceOffline ?? false,
+      aborted: opts.signal?.aborted ?? false,
+    },
+    'hunt summary',
+  );
+}
+
 export class AlbumHunterService {
   private readonly source: SourceConnection;
   private readonly lanes: SearchLanes;
@@ -388,46 +424,64 @@ export class AlbumHunterService {
     artistName: string,
     albumTitle: string,
     canonicalTracks: CanonicalTrackRef[],
-    opts: { skewSearch?: boolean; forceSkew?: boolean } = {},
+    opts: { skewSearch?: boolean; forceSkew?: boolean; signal?: AbortSignal; attemptId?: string } = {},
   ): Promise<HuntResult> {
-    return this.lanes.run('user', async () => {
-      const baseQs = baseQueries(artistName, albumTitle);
-      const base = await this.wave(baseQs);
-      let candidates = scoreFolders(canonicalTracks, base.responses);
-      const bestBasePct = candidates.length ? candidates[0].matchPct : 0;
-      const skewNeeded = opts.skewSearch !== false && bestBasePct < SKEW_TRIGGER_PCT;
-      const acc: HuntResult = {
-        candidates,
-        skewNeeded,
-        queries: [...baseQs],
-        searchesFired: base.fired,
-        searchesAnswered: base.answered,
-        rateLimited: base.rateLimited,
-        sourceOffline: base.sourceOffline,
-      };
-      // Skew runs when the caller enabled it and the base was not confident, or
-      // when the caller forces it; either way each wave stops at a confident folder.
-      const runSkew = opts.forceSkew === true || (opts.skewSearch === true && skewNeeded);
-      if (!runSkew) return acc;
+    const queuedAt = Date.now();
+    const trace: { startedAt: number | null; waves: number; result: HuntResult | null } = {
+      startedAt: null,
+      waves: 0,
+      result: null,
+    };
+    try {
+      return await this.lanes.run(
+        'user',
+        async () => {
+          trace.startedAt = Date.now();
+          const baseQs = baseQueries(artistName, albumTitle);
+          const base = await this.wave(baseQs);
+          trace.waves++;
+          let candidates = scoreFolders(canonicalTracks, base.responses);
+          const bestBasePct = candidates.length ? candidates[0].matchPct : 0;
+          const skewNeeded = opts.skewSearch !== false && bestBasePct < SKEW_TRIGGER_PCT;
+          const acc: HuntResult = {
+            candidates,
+            skewNeeded,
+            queries: [...baseQs],
+            searchesFired: base.fired,
+            searchesAnswered: base.answered,
+            rateLimited: base.rateLimited,
+            sourceOffline: base.sourceOffline,
+          };
+          trace.result = acc;
+          // Skew runs when the caller enabled it and the base was not confident, or
+          // when the caller forces it; either way each wave stops at a confident folder.
+          const runSkew = opts.forceSkew === true || (opts.skewSearch === true && skewNeeded);
+          if (!runSkew) return acc;
 
-      const skewed = buildSkewedQueries(artistName, albumTitle, baseQs).slice(0, MAX_SKEW_QUERIES);
-      for (let i = 0; i < skewed.length; i += SEARCH_LANES) {
-        // Stop once a wave found a confident folder, or the source is offline —
-        // the remaining variants would only hold the lanes for nothing.
-        const bestPct = candidates.length ? candidates[0].matchPct : 0;
-        if (bestPct >= SKEW_TRIGGER_PCT || acc.sourceOffline) break;
-        const chunk = skewed.slice(i, i + SEARCH_LANES);
-        const w = await this.wave(chunk);
-        candidates = mergeCandidates(candidates, scoreFolders(canonicalTracks, w.responses));
-        acc.candidates = candidates;
-        acc.queries.push(...chunk);
-        acc.searchesFired += w.fired;
-        acc.searchesAnswered += w.answered;
-        acc.rateLimited = acc.rateLimited || w.rateLimited;
-        acc.sourceOffline = acc.sourceOffline || w.sourceOffline;
-      }
-      return acc;
-    });
+          const skewed = buildSkewedQueries(artistName, albumTitle, baseQs).slice(0, MAX_SKEW_QUERIES);
+          for (let i = 0; i < skewed.length; i += SEARCH_LANES) {
+            // Stop once a wave found a confident folder, the source is offline, or
+            // the caller has gone (#24) — another wave would hold the lanes for nothing.
+            const bestPct = candidates.length ? candidates[0].matchPct : 0;
+            if (bestPct >= SKEW_TRIGGER_PCT || acc.sourceOffline || opts.signal?.aborted) break;
+            const chunk = skewed.slice(i, i + SEARCH_LANES);
+            const w = await this.wave(chunk);
+            trace.waves++;
+            candidates = mergeCandidates(candidates, scoreFolders(canonicalTracks, w.responses));
+            acc.candidates = candidates;
+            acc.queries.push(...chunk);
+            acc.searchesFired += w.fired;
+            acc.searchesAnswered += w.answered;
+            acc.rateLimited = acc.rateLimited || w.rateLimited;
+            acc.sourceOffline = acc.sourceOffline || w.sourceOffline;
+          }
+          return acc;
+        },
+        opts.signal,
+      );
+    } finally {
+      logHuntSummary(artistName, albumTitle, queuedAt, trace, opts);
+    }
   }
 
   // Phase-1 of a two-phase hunt: run base queries only and report whether skew
