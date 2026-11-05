@@ -142,14 +142,18 @@ export function createProtocolRoutes(deps: ProtocolRouteDeps): Hono {
     if (!parsed.success) return c.json({ error: 'invalid albums/search request' }, 400);
     const { artist, album, canonicalTracks, skew } = parsed.data;
     const hunter = deps.hunter();
+    const signal = c.req.raw.signal;
     try {
       // One lane session: the base pair, then skew waves only while nothing is
       // confidently complete (or always when the caller forces skew). The base
       // is never re-run for the skew phase — it used to be, doubling the lane
-      // time of every hunt that needed skew (#1049).
+      // time of every hunt that needed skew (#1049). The request's own signal
+      // drops the hunt once the host stops waiting (#24).
       const res = await hunter.hunt(artist, album, canonicalTracks, {
         skewSearch: true,
         forceSkew: skew === true,
+        signal,
+        attemptId: c.req.header('x-nicotind-attempt') ?? undefined,
       });
       const body: AddonAlbumSearchResponse = {
         candidates: candidates.put(res.candidates),
@@ -170,6 +174,8 @@ export function createProtocolRoutes(deps: ProtocolRouteDeps): Hono {
       };
       return c.json(body);
     } catch (err) {
+      // Nobody is listening; the hunt summary already recorded `aborted`.
+      if (signal.aborted) return new Response(null, { status: 499 });
       log.warn({ err }, 'albums/search failed');
       return c.json({ error: err instanceof Error ? err.message : 'hunt failed' }, 502);
     }
