@@ -86,6 +86,19 @@ function attemptRows(db: Database, key: string) {
   }>;
 }
 
+/** A protocol job whose item points at this peer's file — "somebody still wants it". */
+function wantedBy(db: Database, jobState: string, username: string, filename: string) {
+  db.run(
+    `INSERT INTO addon_jobs (id, intent, state, created_at, updated_at) VALUES ('j1', 'album', ?, 0, 0)`,
+    [jobState],
+  );
+  db.run(
+    `INSERT INTO addon_job_items (job_id, item_id, username, filename, updated_at)
+     VALUES ('j1', 'i1', ?, ?, 0)`,
+    [username, filename],
+  );
+}
+
 /** Today's reason-blind rule, parameterized — what the old options expressed. */
 const blind =
   (max: number, delayMs = 0): RetryPolicy =>
@@ -107,7 +120,9 @@ describe('DownloadRetryService', () => {
 
     await svc.sweep();
 
-    expect(cancel).toHaveBeenCalledTimes(1);
+    // slskd 0.25.1 supersedes a finished record on enqueue; cancelling first
+    // only strands the file as Cancelled when the enqueue is then refused.
+    expect(cancel).not.toHaveBeenCalled();
     expect(enqueue).toHaveBeenCalledWith('peer', [{ filename: 'Album/01.flac', size: 100 }]);
     expect(retryRow(db, 'peer::Album/01.flac')?.attempts).toBe(1);
   });
@@ -354,6 +369,7 @@ describe('DownloadRetryService', () => {
 
     it('comes back to the same peer after the rest when nobody delivered the file', async () => {
       let now = 1_000;
+      wantedBy(db, 'active', 'peer', 'Album/01 Song.flac');
       const { slskd, enqueue } = makeSlskdMock([busy()]);
       const svc = new DownloadRetryService(slskd, { db, policy: deferFive, now: () => now });
 
@@ -371,6 +387,7 @@ describe('DownloadRetryService', () => {
 
     it('does not come back once another peer delivered the file', async () => {
       let now = 1_000;
+      wantedBy(db, 'active', 'peer', 'Album/01 Song.flac');
       const { slskd, enqueue } = makeSlskdMock([busy()], 'peer', [
         {
           username: 'alt',
@@ -390,30 +407,29 @@ describe('DownloadRetryService', () => {
       expect(attemptRows(db, KEY)).toMatchObject([{ decision: 'defer', outcome: 'covered' }]);
     });
 
-    it.each(['done', 'abandoned'])(
-      'does not come back for an album job that is %s',
-      async (state) => {
-        let now = 1_000;
-        db.run(
-          `INSERT INTO album_jobs (username, directory, canonical_tracks_json, alternates_json, created_at, state)
-           VALUES ('peer', 'Album', '[]', '[]', 0, ?)`,
-          [state],
-        );
-        const { slskd, enqueue } = makeSlskdMock([busy()]);
-        const svc = new DownloadRetryService(slskd, { db, policy: deferFive, now: () => now });
+    // slskd 0.25.1 keeps every transfer until something removes it (8,080 listed
+    // on kpc), so "still listed" says nothing. The job ledger says who wants the
+    // file: a released job is deleted, a cancelled or finished one is closed, and
+    // a fallback repoint moves the item to the alternate's file.
+    it.each([
+      ['its job was cancelled', 'cancelled'],
+      ['its job finished', 'done'],
+      ['its job was released, or its item repointed to another peer', null],
+    ])('does not come back when %s', async (_why, jobState) => {
+      let now = 1_000;
+      if (jobState) wantedBy(db, jobState, 'peer', 'Album/01 Song.flac');
+      const { slskd, enqueue } = makeSlskdMock([busy()]);
+      const svc = new DownloadRetryService(slskd, { db, policy: deferFive, now: () => now });
 
-        await svc.sweep();
-        now = 301_000;
-        await svc.sweep();
+      await svc.sweep();
+      now = 301_000;
+      await svc.sweep();
 
-        expect(enqueue).not.toHaveBeenCalled();
-        expect(attemptRows(db, KEY)).toMatchObject([{ outcome: 'not-needed' }]);
-      },
-    );
+      expect(enqueue).not.toHaveBeenCalled();
+      expect(attemptRows(db, KEY)).toMatchObject([{ outcome: 'not-needed' }]);
+    });
 
-    // slskd forgets a failed transfer after 3 h by default, and a delivered one
-    // after a day; past that, "nobody delivered it" can no longer be checked.
-    it('caps a rest, so the check against what was delivered still holds', async () => {
+    it('caps a rest', async () => {
       const now = 1_000;
       const { slskd } = makeSlskdMock([busy()]);
       const svc = new DownloadRetryService(slskd, {
@@ -430,6 +446,7 @@ describe('DownloadRetryService', () => {
 
     it('a same-peer retry waits out the peer\'s rest', async () => {
       let now = 1_000;
+      wantedBy(db, 'active', 'peer', 'Album/01 Song.flac');
       const { slskd, enqueue } = makeSlskdMock([
         busy(),
         {
@@ -476,6 +493,55 @@ describe('DownloadRetryService', () => {
     now += 60_001;
     await svc.sweep();
     expect(enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it('a refused enqueue leaves the failure retryable, and the policy decides again', async () => {
+    const asked: number[] = [];
+    const policy: RetryPolicy = (_r, retriesSoFar) => (
+      asked.push(retriesSoFar), { action: 'retry', delayMs: 0 }
+    );
+    const { slskd, enqueue } = makeSlskdMock([
+      { id: 't1', filename: 'a.flac', size: 1, state: 'Completed, Errored' },
+    ]);
+    enqueue.mockImplementationOnce(async () => {
+      throw new Error('slskd request failed: 500');
+    });
+    const svc = new DownloadRetryService(slskd, { db, policy });
+
+    await svc.sweep(); // refused
+    await svc.sweep(); // decided again, enqueued
+
+    expect(enqueue).toHaveBeenCalledTimes(2);
+    expect(asked).toEqual([0, 1]);
+    expect(attemptRows(db, 'peer::a.flac')).toMatchObject([
+      { outcome: 'enqueue-failed' },
+      { retries_before: 1, retried: 1, outcome: null },
+    ]);
+  });
+
+  // 88 of the failures listed on kpc read "Application shut down": slskd was
+  // restarted under them (a deploy), which says nothing about the peer.
+  it('a failure from slskd shutting down gets a free retry, without asking the policy', async () => {
+    let asked = 0;
+    const { slskd, enqueue } = makeSlskdMock([
+      {
+        id: 't1',
+        filename: 'a.flac',
+        size: 1,
+        state: 'Completed, Errored',
+        exception: 'Application shut down',
+      },
+    ]);
+    const svc = new DownloadRetryService(slskd, {
+      db,
+      policy: () => (asked++, { action: 'give-up' }),
+    });
+
+    await svc.sweep();
+
+    expect(asked).toBe(0);
+    expect(enqueue).toHaveBeenCalledTimes(1);
+    expect(retryRow(db, 'peer::a.flac')?.attempts).toBe(0);
   });
 
   describe('while Soulseek is offline (#26)', () => {

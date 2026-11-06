@@ -41,7 +41,9 @@ export type SlskdTransferState =
   | 'Completed, Cancelled'
   | 'Completed, TimedOut'
   | 'Completed, Errored'
-  | 'Completed, Rejected';
+  | 'Completed, Rejected'
+  /** e.g. "the remote size of N does not match expected size N" */
+  | 'Completed, Aborted';
 
 export interface SlskdTransfer {
   id: string;

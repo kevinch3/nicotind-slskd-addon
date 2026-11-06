@@ -6,7 +6,14 @@
  * and stores the answer in `transfer_attempts`, so a randomized policy draws
  * one delay per failure, not one per sweep. See docs/download-retries.md.
  */
-export type FailureClass = 'not-shared' | 'peer-busy' | 'timeout' | 'connection' | 'other';
+export type FailureClass =
+  | 'not-shared'
+  | 'peer-busy'
+  | 'timeout'
+  | 'connection'
+  /** slskd was restarted under the transfer. Never put to the policy: a free retry. */
+  | 'shutdown'
+  | 'other';
 
 export type RetryDecision =
   /** Re-enqueue on the same peer once `delayMs` has passed since the failure was seen. */
@@ -21,9 +28,9 @@ export type RetryDecision =
   | { action: 'defer'; restMs: number };
 
 /**
- * The longest rest a defer gets. slskd drops a failed transfer from its list
- * after 3 h and a delivered one after a day (0.25.1 defaults); a come-back
- * must happen while both are still there to check against.
+ * The longest rest a defer gets. A judgment bound, not slskd's: 0.25.1 keeps
+ * every transfer until something removes it. It keeps a policy from parking a
+ * peer — which every album's fallback then passes over — for days.
  */
 export const MAX_REST_MS = 2 * 3_600_000;
 
@@ -35,9 +42,10 @@ export const MAX_REST_MS = 2 * 3_600_000;
 export type RetryPolicy = (reason: FailureClass, retriesSoFar: number) => RetryDecision;
 
 const PATTERNS: Array<[FailureClass, RegExp]> = [
+  ['shutdown', /application shut down/i],
   ['not-shared', /not shared/i],
   ['peer-busy', /too many (files|megabytes)|overwhelmed|try again later/i],
-  ['timeout', /timed out|timeout/i],
+  ['timeout', /timed out|timeout|time limit/i],
   ['connection', /connection|connect|refused|unreachable/i],
 ];
 

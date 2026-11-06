@@ -15,6 +15,17 @@ describe('classifyFailure (#26)', () => {
     ['Completed, Errored', 'Failed to establish a direct or indirect message connection', 'connection'],
     ['Completed, Errored', 'Remote connection closed', 'connection'],
     ['Completed, Errored', 'Verification required', 'other'],
+    // As listed by kpc's slskd 0.25.1 on 2026-11-06.
+    ['Completed, Errored', 'Application shut down', 'shutdown'],
+    ['Completed, TimedOut', 'The wait timed out after 15000 milliseconds', 'timeout'],
+    ['Completed, TimedOut', 'Inactivity timeout of 60000 milliseconds was reached', 'timeout'],
+    ['Completed, TimedOut', 'Download failed to enqueue remotely after hard time limit of 120 secs', 'timeout'],
+    ['Completed, Rejected', 'Transfer rejected: Overwhelmed with requests; try again later.', 'peer-busy'],
+    ['Completed, Errored', 'Transfer failed: Read error: Unable to read data from the transport connection: Connection reset by peer.', 'connection'],
+    ['Completed, Errored', 'Failed to establish a direct or indirect transfer connection to peer (1.2.3.4:50300)', 'connection'],
+    ['Completed, Rejected', 'File read error.', 'other'],
+    ['Completed, Errored', 'Download reported as failed by remote client', 'other'],
+    ['Completed, Rejected', 'Transfer rejected: Verification required: check private messages', 'other'],
   ] as const)('%s / %s → %s', (state, exception, expected) => {
     expect(classifyFailure(state, exception)).toBe(expected);
   });

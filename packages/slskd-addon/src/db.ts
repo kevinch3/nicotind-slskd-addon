@@ -65,11 +65,13 @@ export function applySchema(db: Database): void {
       delay_ms INTEGER,
       failed_at INTEGER NOT NULL,
       retried_at INTEGER,
-      outcome TEXT,
-      UNIQUE (transfer_key, transfer_id)
+      outcome TEXT
     )
   `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_transfer_attempts_failed_at ON transfer_attempts (failed_at)`);
+  db.run(
+    `CREATE INDEX IF NOT EXISTS idx_transfer_attempts_key ON transfer_attempts (transfer_key, transfer_id)`,
+  );
 
   // Peers resting after a deferred failure (#26): retries and the fallback wait.
   db.run(`
