@@ -12,7 +12,20 @@ export type RetryDecision =
   /** Re-enqueue on the same peer once `delayMs` has passed since the failure was seen. */
   | { action: 'retry'; delayMs: number }
   /** Stop retrying this peer; the album fallback moves the track to an alternate. */
-  | { action: 'give-up' };
+  | { action: 'give-up' }
+  /**
+   * Another peer first, then come back: the fallback may move the track now,
+   * this peer rests for `restMs` (no retry or fallback reaches it meanwhile),
+   * and if nobody has delivered the file when the rest ends it is retried here.
+   */
+  | { action: 'defer'; restMs: number };
+
+/**
+ * The longest rest a defer gets. slskd drops a failed transfer from its list
+ * after 3 h and a delivered one after a day (0.25.1 defaults); a come-back
+ * must happen while both are still there to check against.
+ */
+export const MAX_REST_MS = 2 * 3_600_000;
 
 /**
  * @param reason        the failure's class
@@ -41,13 +54,18 @@ export function classifyFailure(state: string, exception: string | null | undefi
  *   not-shared 564 · timeout 118 · peer-busy 130 (Overwhelmed 66 + Too many 64)
  *   and of 122 transfers retried on the same peer, 8 recovered (7%).
  *
- * The trade-off is peer patience against moving on: a give-up hands the track
- * to the album fallback, which searches for another peer (a search costs lane
- * time, and an alternate may be lower quality); a retry keeps the slot this
- * peer already gave us, but every minute it waits is a minute the album is
- * incomplete.
+ * Three moves, by what they cost (docs/download-retries.md "Choosing a move"):
+ * - retry: keeps this peer, but the album's fallback waits for the whole delay.
+ * - give-up: the fallback moves the track now, to a recorded alternate first
+ *   (no search) and a background search only when none has it.
+ * - defer: the fallback moves the track now, this peer rests, and the track
+ *   comes back here if nobody delivered it — the move for a peer that asked
+ *   us to back off.
  *
- * Until this is written it keeps today's reason-blind rule: 3 retries, 60 s.
+ * Until this is written it keeps the pre-#26 rule: a first retry at once,
+ * then 60 s apart, three in all.
  */
 export const retryPolicyFor: RetryPolicy = (_reason, retriesSoFar) =>
-  retriesSoFar < 3 ? { action: 'retry', delayMs: 60_000 } : { action: 'give-up' };
+  retriesSoFar < 3
+    ? { action: 'retry', delayMs: retriesSoFar === 0 ? 0 : 60_000 }
+    : { action: 'give-up' };

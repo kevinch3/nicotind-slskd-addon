@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { classifyFailure } from './retry-policy.js';
+import { classifyFailure, retryPolicyFor } from './retry-policy.js';
 
 // The reason strings are slskd's own `exception` text, as counted on kpc over
 // 48 h to 2026-11-05 (nicotind-slskd-addon#26).
@@ -26,5 +26,16 @@ describe('classifyFailure (#26)', () => {
   it('an errored transfer with no exception text is unclassified, not guessed', () => {
     expect(classifyFailure('Completed, Errored', undefined)).toBe('other');
     expect(classifyFailure('Completed, Errored', '')).toBe('other');
+  });
+});
+
+// The stand-in until the owner writes the table: replace these expectations
+// with the table's own when it lands.
+describe('retryPolicyFor (stand-in)', () => {
+  it('keeps the old rule: first retry at once, then 60 s apart, three in all', () => {
+    expect(retryPolicyFor('other', 0)).toEqual({ action: 'retry', delayMs: 0 });
+    expect(retryPolicyFor('other', 1)).toEqual({ action: 'retry', delayMs: 60_000 });
+    expect(retryPolicyFor('other', 2)).toEqual({ action: 'retry', delayMs: 60_000 });
+    expect(retryPolicyFor('other', 3)).toEqual({ action: 'give-up' });
   });
 });

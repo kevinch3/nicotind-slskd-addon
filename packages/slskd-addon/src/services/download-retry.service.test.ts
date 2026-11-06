@@ -2,7 +2,8 @@ import { describe, expect, it, beforeEach, mock } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { applySchema } from '../db.js';
 import { DownloadRetryService } from './download-retry.service.js';
-import type { RetryPolicy } from './retry-policy.js';
+import { MAX_REST_MS, type RetryPolicy } from './retry-policy.js';
+import { restUntil } from './peer-rest.js';
 import type { Slskd } from '@nicotind/slskd-client';
 
 interface MockFile {
@@ -11,6 +12,13 @@ interface MockFile {
   size: number;
   state: string;
   exception?: string;
+  nextAttemptAt?: string;
+}
+
+interface OtherPeer {
+  username: string;
+  directory: string;
+  files: MockFile[];
 }
 
 /**
@@ -18,7 +26,7 @@ interface MockFile {
  * slskd does. `fail(name, exception)` / `succeed(name)` script what the new
  * transfer does next.
  */
-function makeSlskdMock(files: MockFile[], username = 'peer') {
+function makeSlskdMock(files: MockFile[], username = 'peer', others: OtherPeer[] = []) {
   let generation = 0;
   const byName = (name: string) => files.find((f) => f.filename === name)!;
   const cancel = mock(async (_u: string, _id: string) => undefined);
@@ -35,6 +43,10 @@ function makeSlskdMock(files: MockFile[], username = 'peer') {
       username,
       directories: [{ directory: 'Album', fileCount: files.length, files }],
     },
+    ...others.map((o) => ({
+      username: o.username,
+      directories: [{ directory: o.directory, fileCount: o.files.length, files: o.files }],
+    })),
   ]);
   const slskd = { transfers: { getDownloads, cancel, enqueue } } as unknown as Slskd;
   const fail = (name: string, exception?: string, state = 'Completed, Errored') =>
@@ -315,6 +327,155 @@ describe('DownloadRetryService', () => {
 
       expect(attemptRows(db, 'peer::a.flac')).toEqual([]);
     });
+  });
+
+  describe('defer: another peer first, then come back (#26)', () => {
+    const KEY = 'peer::Album/01 Song.flac';
+    const busy = (): MockFile => ({
+      id: 't1',
+      filename: 'Album/01 Song.flac',
+      size: 1,
+      state: 'Completed, Rejected',
+      exception: 'Too many files',
+    });
+    const deferFive: RetryPolicy = () => ({ action: 'defer', restMs: 300_000 });
+
+    it('hands the track to the fallback at once and rests the peer', async () => {
+      const now = 1_000;
+      const { slskd, enqueue } = makeSlskdMock([busy()]);
+      const svc = new DownloadRetryService(slskd, { db, policy: deferFive, now: () => now });
+
+      await svc.sweep();
+
+      expect(enqueue).not.toHaveBeenCalled();
+      expect(retryRow(db, KEY)?.gave_up).toBe(1);
+      expect(restUntil(db, 'peer')).toBe(301_000);
+    });
+
+    it('comes back to the same peer after the rest when nobody delivered the file', async () => {
+      let now = 1_000;
+      const { slskd, enqueue } = makeSlskdMock([busy()]);
+      const svc = new DownloadRetryService(slskd, { db, policy: deferFive, now: () => now });
+
+      await svc.sweep();
+      now = 300_999;
+      await svc.sweep();
+      expect(enqueue).not.toHaveBeenCalled();
+      now = 301_000;
+      await svc.sweep();
+
+      expect(enqueue).toHaveBeenCalledTimes(1);
+      expect(retryRow(db, KEY)).toMatchObject({ gave_up: 0, attempts: 1 });
+      expect(attemptRows(db, KEY)).toMatchObject([{ decision: 'defer', retried: 1 }]);
+    });
+
+    it('does not come back once another peer delivered the file', async () => {
+      let now = 1_000;
+      const { slskd, enqueue } = makeSlskdMock([busy()], 'peer', [
+        {
+          username: 'alt',
+          directory: 'AltAlbum',
+          files: [
+            { id: 'a1', filename: 'AltAlbum/01 Song.flac', size: 1, state: 'Completed, Succeeded' },
+          ],
+        },
+      ]);
+      const svc = new DownloadRetryService(slskd, { db, policy: deferFive, now: () => now });
+
+      await svc.sweep();
+      now = 301_000;
+      await svc.sweep();
+
+      expect(enqueue).not.toHaveBeenCalled();
+      expect(attemptRows(db, KEY)).toMatchObject([{ decision: 'defer', outcome: 'covered' }]);
+    });
+
+    it.each(['done', 'abandoned'])(
+      'does not come back for an album job that is %s',
+      async (state) => {
+        let now = 1_000;
+        db.run(
+          `INSERT INTO album_jobs (username, directory, canonical_tracks_json, alternates_json, created_at, state)
+           VALUES ('peer', 'Album', '[]', '[]', 0, ?)`,
+          [state],
+        );
+        const { slskd, enqueue } = makeSlskdMock([busy()]);
+        const svc = new DownloadRetryService(slskd, { db, policy: deferFive, now: () => now });
+
+        await svc.sweep();
+        now = 301_000;
+        await svc.sweep();
+
+        expect(enqueue).not.toHaveBeenCalled();
+        expect(attemptRows(db, KEY)).toMatchObject([{ outcome: 'not-needed' }]);
+      },
+    );
+
+    // slskd forgets a failed transfer after 3 h by default, and a delivered one
+    // after a day; past that, "nobody delivered it" can no longer be checked.
+    it('caps a rest, so the check against what was delivered still holds', async () => {
+      const now = 1_000;
+      const { slskd } = makeSlskdMock([busy()]);
+      const svc = new DownloadRetryService(slskd, {
+        db,
+        policy: () => ({ action: 'defer', restMs: 10 * 3_600_000 }),
+        now: () => now,
+      });
+
+      await svc.sweep();
+
+      expect(restUntil(db, 'peer')).toBe(1_000 + MAX_REST_MS);
+      expect(attemptRows(db, KEY)).toMatchObject([{ delay_ms: MAX_REST_MS }]);
+    });
+
+    it('a same-peer retry waits out the peer\'s rest', async () => {
+      let now = 1_000;
+      const { slskd, enqueue } = makeSlskdMock([
+        busy(),
+        {
+          id: 't2',
+          filename: 'Album/02 Other.flac',
+          size: 1,
+          state: 'Completed, TimedOut',
+          exception: 'The wait timed out',
+        },
+      ]);
+      const policy: RetryPolicy = (reason) =>
+        reason === 'peer-busy'
+          ? { action: 'defer', restMs: 300_000 }
+          : { action: 'retry', delayMs: 0 };
+      const svc = new DownloadRetryService(slskd, { db, policy, now: () => now });
+
+      await svc.sweep();
+      expect(enqueue).not.toHaveBeenCalled();
+      now = 301_000;
+      await svc.sweep();
+      expect(enqueue).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // slskd 0.25.1 (pinned in NicotinD's compose) has no download retry of its
+  // own; newer releases do (`transfers.download.retry`). Two layers retrying
+  // one transfer would double the attempts and race each other's enqueue.
+  it('leaves a transfer slskd will retry itself alone until that retry is due', async () => {
+    let now = Date.parse('2026-11-06T00:00:00Z');
+    const { slskd, enqueue } = makeSlskdMock([
+      {
+        id: 't1',
+        filename: 'a.flac',
+        size: 1,
+        state: 'Completed, Errored',
+        nextAttemptAt: '2026-11-06T00:01:00Z',
+      },
+    ]);
+    const svc = new DownloadRetryService(slskd, { db, policy: blind(3), now: () => now });
+
+    await svc.sweep();
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(attemptRows(db, 'peer::a.flac')).toEqual([]);
+    now += 60_001;
+    await svc.sweep();
+    expect(enqueue).toHaveBeenCalledTimes(1);
   });
 
   describe('while Soulseek is offline (#26)', () => {

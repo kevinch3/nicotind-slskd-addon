@@ -55,6 +55,7 @@ export function applySchema(db: Database): void {
       transfer_id TEXT NOT NULL,
       username TEXT NOT NULL,
       filename TEXT NOT NULL,
+      directory TEXT,
       state TEXT NOT NULL,
       exception TEXT,
       failure_class TEXT NOT NULL,
@@ -69,6 +70,15 @@ export function applySchema(db: Database): void {
     )
   `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_transfer_attempts_failed_at ON transfer_attempts (failed_at)`);
+
+  // Peers resting after a deferred failure (#26): retries and the fallback wait.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS peer_rest (
+      username TEXT PRIMARY KEY,
+      until INTEGER NOT NULL,
+      reason TEXT
+    )
+  `);
 
   db.run(`
     CREATE TABLE IF NOT EXISTS hidden_transfers (

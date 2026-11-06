@@ -2,8 +2,12 @@ import { createLogger } from '@nicotind/addon-sdk';
 import type { Slskd, SlskdTransfer } from '@nicotind/slskd-client';
 import type { Database } from 'bun:sqlite';
 import { getDatabase } from '../db.js';
+import { ACTIVE_STATES } from './album-fallback.service.js';
+import { normalizeBasename } from './track-pick.js';
+import { pruneRests, restPeer, restingPeers } from './peer-rest.js';
 import {
   classifyFailure,
+  MAX_REST_MS,
   retryPolicyFor,
   type RetryDecision,
   type RetryPolicy,
@@ -34,6 +38,7 @@ interface AttemptRow {
   failed_at: number;
   retried_at: number | null;
   source_offline: number;
+  outcome: string | null;
 }
 
 export interface DownloadRetryOptions {
@@ -56,9 +61,11 @@ export interface DownloadRetryOptions {
 /**
  * Self-healing reconciler. Polls slskd for failed transfers and, per the retry
  * policy for the failure's reason, re-enqueues them on the same peer — slskd
- * keeps the partial `.incomplete` file and resumes it — or gives up, which
- * leaves the transfer in Error for cross-peer fallback (AlbumFallbackService)
- * to move to an alternate. Every failure is kept in `transfer_attempts`.
+ * keeps the partial `.incomplete` file and resumes it — gives up, which leaves
+ * the transfer in Error for cross-peer fallback (AlbumFallbackService) to move
+ * to an alternate, or defers: the fallback may move it now, the peer rests, and
+ * the file comes back here if nobody delivered it. Every failure is kept in
+ * `transfer_attempts`.
  * See docs/download-retries.md.
  */
 export class DownloadRetryService {
@@ -115,11 +122,14 @@ export class DownloadRetryService {
       const ready = this.isSourceReady ? await this.isSourceReady() : true;
       const hiddenIds = this.hiddenIds();
       const now = this.now();
+      const resting = restingPeers(this.db, now);
+      const delivered = deliveredBasenames(downloads);
 
       for (const group of downloads) {
+        const username = group.username;
         for (const dir of group.directories) {
           for (const file of dir.files) {
-            const key = `${group.username}::${file.filename}`;
+            const key = `${username}::${file.filename}`;
 
             if (file.state === 'Completed, Succeeded') {
               this.closeRetried(key, 'succeeded');
@@ -129,27 +139,46 @@ export class DownloadRetryService {
 
             if (!isRetryable(file.state)) continue;
             if (hiddenIds.has(file.id)) continue;
+            // A slskd that retries downloads itself has this one in hand.
+            if (file.nextAttemptAt && Date.parse(file.nextAttemptAt) > now) continue;
 
             const row = this.getRow(key);
-            if (row?.gave_up) continue;
             const retriesSoFar = row?.attempts ?? 0;
+            if (row?.gave_up) {
+              await this.comeBack(username, dir.directory, file, key, retriesSoFar, {
+                ready,
+                now,
+                delivered,
+              });
+              continue;
+            }
 
-            const attempt = this.observe(group.username, file, key, retriesSoFar, !ready, now);
+            const attempt = this.observe(username, dir.directory, file, key, retriesSoFar, !ready, now);
             // Already re-enqueued; slskd has not swapped in the new transfer yet.
             if (attempt.retried_at !== null) continue;
 
             if (attempt.decision === 'give-up') {
-              this.markGaveUp(key, group.username, file.filename);
+              this.markGaveUp(key, username, file.filename);
               this.setOutcome(attempt.id, 'gave-up');
               log.warn({ key, retriesSoFar }, 'Giving up on this peer — leaving the transfer for fallback');
               continue;
             }
 
+            if (attempt.decision === 'defer') {
+              const restMs = attempt.delay_ms ?? 0;
+              this.markGaveUp(key, username, file.filename);
+              restPeer(this.db, username, now + restMs, 'deferred');
+              resting.add(username);
+              log.info({ key, restMs }, 'Resting this peer — the fallback may try another first');
+              continue;
+            }
+
             if (!ready) continue;
+            if (resting.has(username)) continue;
             if (now - attempt.failed_at < (attempt.delay_ms ?? 0)) continue;
 
             const spent = retriesSoFar + (attempt.source_offline ? 0 : 1);
-            await this.retry(group.username, file, key, spent, attempt.id, now);
+            await this.retry(username, file, key, spent, attempt.id, now);
           }
         }
       }
@@ -169,6 +198,39 @@ export class DownloadRetryService {
   }
 
   /**
+   * A deferred file whose rest is over comes back to its peer — unless another
+   * peer has delivered it (or is delivering it), or its album job is closed.
+   * Checked only when the rest ends, so an alternate copy that fails mid-rest
+   * does not cost the come-back.
+   */
+  private async comeBack(
+    username: string,
+    directory: string,
+    file: SlskdTransfer,
+    key: string,
+    retriesSoFar: number,
+    at: { ready: boolean; now: number; delivered: Set<string> },
+  ): Promise<void> {
+    const attempt = this.attemptFor(key, file.id);
+    if (attempt?.decision !== 'defer' || attempt.retried_at !== null || attempt.outcome !== null) {
+      return;
+    }
+    if (at.now - attempt.failed_at < (attempt.delay_ms ?? 0)) return;
+    if (at.delivered.has(normalizeBasename(file.filename))) {
+      this.setOutcome(attempt.id, 'covered');
+      return;
+    }
+    if (this.albumJobClosed(username, directory)) {
+      this.setOutcome(attempt.id, 'not-needed');
+      return;
+    }
+    if (!at.ready) return;
+    this.db.run('UPDATE transfer_retries SET gave_up = 0 WHERE transfer_key = ?', [key]);
+    await this.retry(username, file, key, retriesSoFar + 1, attempt.id, at.now);
+    log.info({ key }, 'Back to a rested peer — nobody else delivered the file');
+  }
+
+  /**
    * The ledger row for this failure, deciding it on first sight. A failure seen
    * while Soulseek is offline is not put to the policy: it gets one free retry
    * once the source is back, because the outage, not the peer, is its likely
@@ -176,6 +238,7 @@ export class DownloadRetryService {
    */
   private observe(
     username: string,
+    directory: string,
     file: SlskdTransfer,
     key: string,
     retriesSoFar: number,
@@ -192,16 +255,22 @@ export class DownloadRetryService {
     const decision: RetryDecision = offline
       ? { action: 'retry', delayMs: 0 }
       : this.policy(failureClass, retriesSoFar);
-    const delayMs = decision.action === 'retry' ? decision.delayMs : null;
+    const delayMs =
+      decision.action === 'retry'
+        ? decision.delayMs
+        : decision.action === 'defer'
+          ? Math.min(decision.restMs, MAX_REST_MS)
+          : null;
     this.db.run(
-      `INSERT INTO transfer_attempts (transfer_key, transfer_id, username, filename, state, exception,
-         failure_class, retries_before, source_offline, decision, delay_ms, failed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO transfer_attempts (transfer_key, transfer_id, username, filename, directory, state,
+         exception, failure_class, retries_before, source_offline, decision, delay_ms, failed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         key,
         file.id,
         username,
         file.filename,
+        directory,
         file.state,
         file.exception ?? null,
         failureClass,
@@ -253,7 +322,7 @@ export class DownloadRetryService {
   private attemptFor(key: string, transferId: string): AttemptRow | null {
     return this.db
       .query(
-        `SELECT id, decision, delay_ms, failed_at, retried_at, source_offline
+        `SELECT id, decision, delay_ms, failed_at, retried_at, source_offline, outcome
          FROM transfer_attempts WHERE transfer_key = ? AND transfer_id = ?`,
       )
       .get(key, transferId) as AttemptRow | null;
@@ -276,6 +345,17 @@ export class DownloadRetryService {
     if (now - this.lastPruneAt < PRUNE_EVERY_MS) return;
     this.lastPruneAt = now;
     this.db.run('DELETE FROM transfer_attempts WHERE failed_at < ?', [now - this.attemptRetentionMs]);
+    pruneRests(this.db, now);
+  }
+
+  /** The latest album job for this folder is finished or nobody owns it any more. */
+  private albumJobClosed(username: string, directory: string): boolean {
+    const row = this.db
+      .query(
+        'SELECT state FROM album_jobs WHERE username = ? AND directory = ? ORDER BY id DESC LIMIT 1',
+      )
+      .get(username, directory) as { state: string } | null;
+    return row?.state === 'done' || row?.state === 'abandoned';
   }
 
   private hiddenIds(): Set<string> {
@@ -313,4 +393,21 @@ export class DownloadRetryService {
       [key, username, filename],
     );
   }
+}
+
+/** Basenames delivered or on their way from any peer — the fallback's own rule. */
+function deliveredBasenames(
+  downloads: Awaited<ReturnType<Slskd['transfers']['getDownloads']>>,
+): Set<string> {
+  const out = new Set<string>();
+  for (const group of downloads) {
+    for (const dir of group.directories) {
+      for (const file of dir.files) {
+        if (file.state === 'Completed, Succeeded' || ACTIVE_STATES.has(file.state)) {
+          out.add(normalizeBasename(file.filename));
+        }
+      }
+    }
+  }
+  return out;
 }

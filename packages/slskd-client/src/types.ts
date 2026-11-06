@@ -56,6 +56,8 @@ export interface SlskdTransfer {
   endedAt?: string;
   /** Why a transfer that did not succeed ended, e.g. "Transfer rejected: File not shared." */
   exception?: string | null;
+  /** When slskd itself will retry this transfer; set only by slskd versions that retry downloads. */
+  nextAttemptAt?: string | null;
 }
 
 export interface SlskdTransferDirectory {
