@@ -60,6 +60,7 @@ export function applySchema(db: Database): void {
       exception TEXT,
       failure_class TEXT NOT NULL,
       retries_before INTEGER NOT NULL,
+      source_attempts INTEGER,
       source_offline INTEGER NOT NULL DEFAULT 0,
       decision TEXT NOT NULL,
       delay_ms INTEGER,

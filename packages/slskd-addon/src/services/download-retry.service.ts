@@ -61,8 +61,8 @@ export interface DownloadRetryOptions {
 
 /**
  * Self-healing reconciler. Polls slskd for failed transfers and, per the retry
- * policy for the failure's reason, re-enqueues them on the same peer — from
- * byte 0: slskd 0.25.1 does not resume a partial file — gives up, which leaves
+ * policy for the failure's reason, re-enqueues them on the same peer — slskd
+ * 0.26+ resumes the partial file (0.25.1 restarted at byte 0) — gives up, which leaves
  * the transfer in Error for cross-peer fallback (AlbumFallbackService) to move
  * to an alternate, or defers: the fallback may move it now, the peer rests, and
  * the file comes back here if nobody delivered it. Every failure is kept in
@@ -272,8 +272,9 @@ export class DownloadRetryService {
           : null;
     this.db.run(
       `INSERT INTO transfer_attempts (transfer_key, transfer_id, username, filename, directory, state,
-         exception, failure_class, retries_before, source_offline, decision, delay_ms, failed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         exception, failure_class, retries_before, source_attempts, source_offline, decision,
+         delay_ms, failed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         key,
         file.id,
@@ -284,6 +285,7 @@ export class DownloadRetryService {
         file.exception ?? null,
         failureClass,
         retriesSoFar,
+        file.attempts || null,
         offline ? 1 : 0,
         decision.action,
         delayMs,
@@ -297,6 +299,7 @@ export class DownloadRetryService {
         exception: file.exception ?? null,
         failureClass,
         retriesSoFar,
+        sourceAttempts: file.attempts || null,
         sourceOffline: offline,
         decision: decision.action,
         delayMs,

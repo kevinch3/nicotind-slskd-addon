@@ -60,6 +60,8 @@ export interface SlskdTransfer {
   exception?: string | null;
   /** When slskd itself will retry this transfer; set only by slskd versions that retry downloads. */
   nextAttemptAt?: string | null;
+  /** Attempts slskd itself made (0.26+ retries transient failures before reporting one). */
+  attempts?: number;
 }
 
 export interface SlskdTransferDirectory {

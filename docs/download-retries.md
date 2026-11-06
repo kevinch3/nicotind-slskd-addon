@@ -4,8 +4,8 @@
 slskd's downloads every 15 s. For each transfer that ended `Completed, Errored | TimedOut | Rejected`
 it makes one of three moves:
 
-- **retry**: re-enqueue on the same peer. The file restarts from byte 0, because slskd 0.25.1 does
-  not resume a partial file (its enqueue sets `StartOffset = 0`).
+- **retry**: re-enqueue on the same peer. slskd 0.26+ resumes the partial file. 0.25.1 restarted
+  it at byte 0, because its enqueue set `StartOffset = 0`.
 - **give up**: mark `transfer_retries.gave_up`, which lets `AlbumFallbackService` move the track to
   another peer.
 - **defer**: the same hand-off, but the peer only rests, and the file comes back to it later if
@@ -62,7 +62,7 @@ What each move costs:
 
 | move | the album | this peer | search time |
 | --- | --- | --- | --- |
-| `retry` | **waits** for the whole delay: the fallback acts only once the primary's folder has stopped working, and a file waiting on a retry counts as working | asked again; the file restarts from byte 0 | none |
+| `retry` | **waits** for the whole delay: the fallback acts only once the primary's folder has stopped working, and a file waiting on a retry counts as working | asked again; the partial resumes on slskd 0.26+ | none |
 | `give-up` | moves on at once | never asked again for this file | only if no recorded alternate has the track |
 | `defer` | moves on at once | rests, then gets the file back if nobody else delivered it | only if no awake recorded alternate has the track |
 
@@ -117,7 +117,24 @@ same failure again with the new `retriesSoFar`. The service no longer cancels th
 before re-enqueueing. That cancel was never needed, and when the enqueue was then refused it left
 the file `Completed, Cancelled`, a state nothing retries.
 
-## slskd on kpc (verified 2026-11-06)
+## slskd 0.26 (NicotinD#1630)
+
+NicotinD#1630 raises kpc's slskd to 0.26.2. Two changes matter here, checked against its source:
+
+- **slskd retries transient failures itself,** before one ever reaches this service. That is 3
+  attempts, 5 s growing to 60 s, resuming the partial file. Between attempts the transfer sits in
+  `Queued, Locally` under one id, so this service sees only the failure left after the last
+  attempt. `source_attempts` records how many attempts slskd made. Rejections (`not-shared`,
+  `peer-busy`), cancellations, duplicates and size mismatches are not retried by slskd, and arrive
+  at once.
+- **This service's re-enqueue resumes too,** because a partial file is named by peer and remote
+  path, not by transfer id.
+
+For the policy, that means a `timeout` or `connection` failure has already failed 3 quick, resumed
+attempts by the time it is asked about. The 0.26.2 retry does not set `nextAttemptAt` either, so
+the guard below stays inert.
+
+## slskd on kpc before the upgrade (verified 2026-11-06)
 
 What this service assumes about slskd, and how each point was checked:
 
@@ -162,7 +179,8 @@ hourly.
 | --- | --- |
 | `directory` | the folder (the album) the file belongs to |
 | `state`, `exception`, `failure_class` | what slskd said, and its class |
-| `retries_before` | same-peer retries already spent on this file when it failed |
+| `retries_before` | same-peer retries this service had already spent on this file when it failed |
+| `source_attempts` | attempts slskd itself made before reporting the failure (0.26+; null when it made none) |
 | `source_offline` | first seen while Soulseek was logged out |
 | `decision`, `delay_ms` | the stored decision; `delay_ms` is the retry delay or the (capped) rest, null for a give-up |
 | `failed_at`, `retried_at` | first seen, and re-enqueued (null if never) |

@@ -13,6 +13,7 @@ interface MockFile {
   state: string;
   exception?: string;
   nextAttemptAt?: string;
+  attempts?: number;
 }
 
 interface OtherPeer {
@@ -309,6 +310,27 @@ describe('DownloadRetryService', () => {
           outcome: 'succeeded',
         },
       ]);
+    });
+
+    // slskd 0.26 retries transient failures itself before one ever turns
+    // `Completed, …`; its count says how much patience a failure has had.
+    it('records how many attempts slskd itself made before the failure', async () => {
+      const { slskd } = makeSlskdMock([
+        { id: 't1', filename: 'a.flac', size: 1, state: 'Completed, TimedOut', attempts: 3 },
+        { id: 't2', filename: 'b.flac', size: 1, state: 'Completed, Rejected' },
+      ]);
+      const svc = new DownloadRetryService(slskd, { db, policy: blind(3) });
+
+      await svc.sweep();
+
+      const sourceAttempts = (key: string) =>
+        (
+          db.query('SELECT source_attempts AS n FROM transfer_attempts WHERE transfer_key = ?').get(
+            key,
+          ) as { n: number | null }
+        ).n;
+      expect(sourceAttempts('peer::a.flac')).toBe(3);
+      expect(sourceAttempts('peer::b.flac')).toBeNull();
     });
 
     it('records a give-up as its own outcome', async () => {
