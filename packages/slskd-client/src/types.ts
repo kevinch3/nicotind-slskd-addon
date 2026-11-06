@@ -54,6 +54,8 @@ export interface SlskdTransfer {
   percentComplete: number;
   startedAt?: string;
   endedAt?: string;
+  /** Why a transfer that did not succeed ended, e.g. "Transfer rejected: File not shared." */
+  exception?: string | null;
 }
 
 export interface SlskdTransferDirectory {

@@ -29,6 +29,8 @@ A self-contained [Bun](https://bun.com) workspace:
 
 The published protocol contract lives in [`docs/addon-protocol/v1.md`](docs/addon-protocol/v1.md)
 (+ generated `docs/addon-protocol/v1/schema.json`, regenerate with `bun run gen:schema`).
+How failed transfers are retried, by reason, and how to read the retry ledger:
+[`docs/download-retries.md`](docs/download-retries.md).
 
 ## Run
 

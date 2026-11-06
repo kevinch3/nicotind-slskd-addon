@@ -56,6 +56,7 @@ const fallback = new AlbumFallbackService(slskdRef.current, {
 });
 const retry = new DownloadRetryService(slskdRef.current, {
   db,
+  isSourceReady: () => sourceConnection.isReady(),
   onSweep: () => fallback.sweep(),
 });
 retry.start();
