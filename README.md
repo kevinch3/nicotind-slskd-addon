@@ -54,6 +54,21 @@ bun install
 SLSKD_ADDON_TOKEN=dev SLSKD_ADDON_SLSKD_URL=http://127.0.0.1:5030 bun start
 ```
 
+### Same host, no Docker
+
+Run it as above with `SLSKD_ADDON_HOST=127.0.0.1`, so only this machine can reach it, and
+register `http://127.0.0.1:8585` under **Extensions → Add a remote addon** with the same token.
+
+### Before you connect: the Soulseek account
+
+- **Use a dedicated Soulseek account.** The network allows one login per account: when the addon
+  signs in, any other client using that account (your desktop Soulseek, Nicotine+) is
+  disconnected, and the two keep kicking each other off.
+- **Sharing is off by default, and that has a cost.** With no `SLSKD_ADDON_MUSIC_DIR`, nothing is
+  shared back. Many peers refuse or deprioritise users who share nothing, so some downloads queue
+  forever or are denied. Pointing `SLSKD_ADDON_MUSIC_DIR` at your library (read-only) shares it with
+  the network: decide that deliberately, since what you share is visible to every peer.
+
 ## Configuration
 
 | Env var | Required | Default | Purpose |
@@ -63,6 +78,7 @@ SLSKD_ADDON_TOKEN=dev SLSKD_ADDON_SLSKD_URL=http://127.0.0.1:5030 bun start
 | `SLSKD_ADDON_SLSKD_USERNAME` / `_PASSWORD` | if slskd auth is on | — | slskd API credentials |
 | `SLSKD_ADDON_SOULSEEK_USERNAME` / `_PASSWORD` | — | — | Soulseek network credentials pushed to slskd |
 | `SLSKD_ADDON_PORT` | — | `8585` | HTTP listen port |
+| `SLSKD_ADDON_HOST` | — | `0.0.0.0` | Listen address; `127.0.0.1` when NicotinD runs on the same host (keeps it off the LAN) |
 | `SLSKD_ADDON_DB` | — | `/data/slskd-addon.sqlite` | Job-ledger SQLite path |
 | `SLSKD_ADDON_DOWNLOADS_DIR` | — | `/data/downloads` | Where slskd lands transfers before HTTP delivery |
 | `SLSKD_ADDON_MUSIC_DIR` | — | — | Read-only music dir to share back to Soulseek peers |

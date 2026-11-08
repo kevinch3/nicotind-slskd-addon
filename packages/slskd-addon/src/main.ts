@@ -3,6 +3,7 @@ import { createLogger, type AddonStatusRow } from '@nicotind/addon-sdk';
 import { getDatabase } from './db.js';
 import { resolveConfig } from './config.js';
 import { createAddonApp } from './server.js';
+import { listenAddress } from './listen.js';
 import { AlbumHunterService } from './services/album-hunter.service.js';
 import { TrackHunterService } from './services/track-hunter.service.js';
 import { AlbumFallbackService } from './services/album-fallback.service.js';
@@ -148,6 +149,6 @@ const app = createAddonApp({
   },
 });
 
-const port = Number(process.env.SLSKD_ADDON_PORT ?? 8585);
-Bun.serve({ port, fetch: app.fetch });
-log.info({ port }, 'slskd addon listening');
+const { hostname, port } = listenAddress(process.env);
+Bun.serve({ hostname, port, fetch: app.fetch });
+log.info({ hostname, port }, 'slskd addon listening');
