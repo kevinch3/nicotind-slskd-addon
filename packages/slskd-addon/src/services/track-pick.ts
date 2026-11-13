@@ -6,8 +6,7 @@ import { normalizeTitle, stripTitleQualifiers, titlesOverlap } from './album-hun
  * free of slskd/IO so it's unit-testable in isolation.
  */
 
-// `buildTrackQueries` moved to @nicotind/core (shared with the album skew builder,
-// improved to accent-fold / punctuation-strip / distinctive-token variants). Re-
+// `buildTrackQueries` lives in @nicotind/addon-sdk beside the album retry builder. Re-
 // exported so track-hunter + tests keep their `./track-pick` import path.
 export { buildTrackQueries } from '@nicotind/addon-sdk';
 

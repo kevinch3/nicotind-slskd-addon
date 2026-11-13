@@ -79,17 +79,18 @@ describe('pickBestTrackFile', () => {
 });
 
 describe('buildTrackQueries', () => {
-  it('emits exact, punctuation-stripped, title-only, and qualifier-stripped variants', () => {
-    const out = buildTrackQueries('Bahiano', 'Cuando reina el Amor (feat. X)');
-    expect(out[0]).toBe('Bahiano Cuando reina el Amor (feat. X)'); // exact leads
-    expect(out).toContain('Cuando reina el Amor (feat. X)'); // title only
-    expect(out).toContain('Bahiano Cuando reina el Amor'); // qualifier stripped
-    expect(out).toContain('Bahiano Cuando reina el Amor feat X'); // punctuation stripped
-    expect(out).not.toContain('Bahian Cuando reina el Amor (feat. X)'); // no char-drop
+  it('emits exact, wildcarded, and qualifier-stripped variants in order', () => {
+    expect(buildTrackQueries('Bahiano', 'Cuando reina el Amor (feat. X)')).toEqual([
+      'Bahiano Cuando reina el Amor (feat. X)',
+      '*ahiano Cuando reina el Amor (feat. X)',
+      '*ahiano *uando *eina el *mor (feat. X)',
+      'Bahiano Cuando reina el Amor',
+      '*ahiano Cuando reina el Amor',
+    ]);
   });
 
-  it('de-dupes and skips empty variants for a bare title', () => {
-    expect(buildTrackQueries('U2', 'One')).toEqual(['U2 One', 'One']);
+  it('a phrase with no word worth wildcarding is the exact query alone', () => {
+    expect(buildTrackQueries('U2', 'One')).toEqual(['U2 One']);
   });
 });
 

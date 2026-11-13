@@ -98,14 +98,14 @@ export class TrackHunterService {
   }
 
   /**
-   * Hunt a single track across the skewed query variants, stopping at the first
-   * that yields a pick. why: a lone `"<artist> <title>"` search is silently
-   * soft-banned for many phrases, so we fall through progressively skewed forms
-   * (`buildTrackQueries`) the same way the album hunter's skew-search bypasses the
-   * ban. A first-query hit fires no extra searches.
+   * Hunt a single track across its query variants, stopping at the first that
+   * yields a pick. why: the server drops a `"<artist> <title>"` search carrying
+   * a banned word, so we fall through the wildcarded forms (`buildTrackQueries`)
+   * the same way the album hunter's retry wave does. A first-query hit fires no
+   * extra searches.
    */
   private async huntTrack(artistName: string, title: string): Promise<TrackPick | null> {
-    // One lane session per track: the progressively skewed queries run inside it.
+    // One lane session per track: every query variant runs inside it.
     return this.lanes.run('user', async () => {
       for (const query of buildTrackQueries(artistName, title)) {
         const pick = await this.runQuery(query, title);
