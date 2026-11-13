@@ -147,7 +147,7 @@ describe('addon protocol routes', () => {
       return { id: `s-${q}`, state: 'Completed' } as never;
     };
     h.slskdRef.current.searches.getResponses = (async (id: string) =>
-      id === 's-Album Artist'
+      id === 's-*rtist Album'
         ? [{ username: 'skewpeer', freeUploadSlots: 1, queueLength: 0, uploadSpeed: 100,
              files: [{ filename: 'Music\\Album\\01 Song One.mp3', size: 1000 }, { filename: 'Music\\Album\\02 Song Two.mp3', size: 2000 }] }]
         : []) as never;
@@ -156,7 +156,7 @@ describe('addon protocol routes', () => {
       json({ artist: 'Artist', album: 'Album', canonicalTracks: [{ title: 'Song One' }, { title: 'Song Two' }] }),
     );
     const body = (await res.json()) as AddonAlbumSearchResponse;
-    expect(fired).toEqual(['Artist Album', 'Artist - Album', 'Album Artist', 'Album']);
+    expect(fired).toEqual(['Artist Album', 'Artist - Album', '*rtist Album', '*rtist *lbum']);
     expect(body.skewNeeded).toBe(true);
     expect(body.candidates[0]!.matchPct).toBe(100);
     expect(body.searchesFired).toBe(4);

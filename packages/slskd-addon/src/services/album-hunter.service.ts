@@ -59,9 +59,8 @@ export const SEARCH_TIMEOUT_MS = 8_000;
 // reports the searches complete.
 export const WAVE_TIMEOUT_MS = 30_000;
 
-// Skew variants are ranked most-precise first; the tail (title-only, broad) is
-// the least likely to add a folder the earlier ones missed and would cost a
-// whole extra lane cycle, so a hunt stops at this many.
+// The retry queries (`buildSkewedQueries`) are ranked most-precise first; a hunt
+// stops at this many so a long list never costs a third lane cycle.
 export const MAX_SKEW_QUERIES = 4;
 
 // 429 retry (#hunt-429): creates are serialized by the client, but a 429 can

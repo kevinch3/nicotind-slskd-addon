@@ -80,12 +80,12 @@ describe('AlbumHunterService', () => {
     });
 
     it('fires the base pair, then skew variants two at a time, stopping at the first confident wave', async () => {
-      // Base misses; the first skew wave (fold + punctuation-strip variants) hits.
-      const slskd = makeQueryAwareSlskdStub({ 'Artist Album': [], 'Artist - Album': [], 'Album Artist': FULL('Music\\Artist\\Album') });
+      // Base misses; the wildcard wave hits.
+      const slskd = makeQueryAwareSlskdStub({ 'Artist Album': [], 'Artist - Album': [], '*rtist Album': FULL('Music\\Artist\\Album') });
       const res = await new AlbumHunterService(slskd).hunt('Artist', 'Album', TRACKS, { skewSearch: true });
       const fired = (slskd.searches.create as ReturnType<typeof mock>).mock.calls.map((c) => c[0]);
       // 2 base + one wave of 2 — never the whole skew list, never the base again.
-      expect(fired).toEqual(['Artist Album', 'Artist - Album', 'Album Artist', 'Album']);
+      expect(fired).toEqual(['Artist Album', 'Artist - Album', '*rtist Album', '*rtist *lbum']);
       expect(res.queries).toEqual(fired);
       expect(res.candidates[0]!.matchPct).toBe(100);
       expect(res.searchesFired).toBe(4);
@@ -94,7 +94,7 @@ describe('AlbumHunterService', () => {
     });
 
     it('forceSkew still stops at a confident base wave instead of holding the lanes', async () => {
-      const slskd = makeQueryAwareSlskdStub({ 'Artist Album': FULL('Music\\Artist\\Album'), 'Artist - Album': [], 'Album Artist': [], 'Album': [] });
+      const slskd = makeQueryAwareSlskdStub({ 'Artist Album': FULL('Music\\Artist\\Album'), 'Artist - Album': [], '*rtist Album': [], '*rtist *lbum': [] });
       const res = await new AlbumHunterService(slskd).hunt('Artist', 'Album', TRACKS, { forceSkew: true });
       expect(res.skewNeeded).toBe(false);
       // The base pair was confident, so no skew wave was worth a lane cycle.
@@ -602,35 +602,28 @@ describe('AlbumHunterService', () => {
   });
 
   describe('buildSkewedQueries', () => {
-    it('adds a qualifier-stripped title variant for parenthetical titles', () => {
-      const base = ['Kygo Stay (feat. Justin Bieber)', 'Kygo - Stay (feat. Justin Bieber)'];
-      const skewed = buildSkewedQueries('Kygo', 'Stay (feat. Justin Bieber)', base);
-      expect(skewed).toContain('Kygo Stay');
-      expect(skewed).toContain('Stay');
-    });
-
-    it('produces only faithful variants for plain input (no last-char truncation)', () => {
+    it('wildcards the artist words, then every word, and never repeats a base query', () => {
       const base = ['Artist Album', 'Artist - Album'];
       const skewed = buildSkewedQueries('Artist', 'Album', base);
-      // For plain ASCII input the fold / punctuation / drop-the / distinctive
-      // variants all collapse to a base query, so only reorder + album-only
-      // survive. The old "Artis Album"/"Artis - Album" char-drop hack is gone.
-      expect(skewed).toEqual(['Album Artist', 'Album']);
-      expect(skewed).not.toContain('Artis Album');
+      expect(skewed).toEqual(['*rtist Album', '*rtist *lbum']);
       for (const q of skewed) expect(base).not.toContain(q);
     });
 
-    it('adds an accent-folded variant for an accented artist/album', () => {
-      const base = ['Beyoncé Lemonade', 'Beyoncé - Lemonade'];
-      const skewed = buildSkewedQueries('Beyoncé', 'Lemonade', base);
-      expect(skewed).toContain('beyonce lemonade');
+    it('a self-titled album gets a query free of the bare artist word', () => {
+      const base = ['Gorillaz Gorillaz', 'Gorillaz - Gorillaz'];
+      expect(buildSkewedQueries('Gorillaz', 'Gorillaz', base)).toEqual(['*orillaz *orillaz']);
     });
 
-    it('drops the leading "the" from artist and album', () => {
+    it('adds the qualifier-stripped title for parenthetical titles', () => {
+      const base = ['Kygo Stay (feat. Justin Bieber)', 'Kygo - Stay (feat. Justin Bieber)'];
+      const skewed = buildSkewedQueries('Kygo', 'Stay (feat. Justin Bieber)', base);
+      expect(skewed).toContain('*ygo Stay');
+    });
+
+    it('leaves filler words literal', () => {
       const base = ['The Beatles The White Album', 'The Beatles - The White Album'];
       const skewed = buildSkewedQueries('The Beatles', 'The White Album', base);
-      expect(skewed).toContain('Beatles White Album');
-      // de-duped, no empties, none equal to a base query
+      expect(skewed[0]).toBe('The *eatles The White Album');
       expect(new Set(skewed).size).toBe(skewed.length);
       expect(skewed.every((q) => q.trim().length > 0)).toBe(true);
     });
@@ -647,8 +640,8 @@ describe('AlbumHunterService', () => {
     };
 
     it('retries with skewed queries when the base queries return empty', async () => {
-      // Base queries are "soft-banned" (empty); the album-only skew variant hits.
-      const slskd = makeQueryAwareSlskdStub({ Album: [fullAlbum] });
+      // Base queries carry a banned word (empty); the wildcarded retry hits.
+      const slskd = makeQueryAwareSlskdStub({ '*rtist Album': [fullAlbum] });
 
       const hunter = new AlbumHunterService(slskd);
       const { candidates } = await hunter.hunt('Artist', 'Album', TRACKS, { skewSearch: true });
@@ -662,11 +655,11 @@ describe('AlbumHunterService', () => {
         (c) => c[0],
       );
       expect(created).toContain('Artist Album');
-      expect(created).toContain('Album');
+      expect(created).toContain('*rtist Album');
     });
 
     it('does not fire skewed queries when skewSearch is off', async () => {
-      const slskd = makeQueryAwareSlskdStub({ Album: [fullAlbum] });
+      const slskd = makeQueryAwareSlskdStub({ '*rtist Album': [fullAlbum] });
 
       const hunter = new AlbumHunterService(slskd);
       const { candidates } = await hunter.hunt('Artist', 'Album', TRACKS);
@@ -680,14 +673,14 @@ describe('AlbumHunterService', () => {
 
     it('fires skewed queries on a weak (non-empty) base and merges results', async () => {
       // Base surfaces only a thin 33% partial; the complete album hides behind a
-      // soft-banned phrase and is reachable via the album-only skew variant.
+      // banned word and is reachable via the wildcarded retry.
       const partial: StubResponse = {
         username: 'pete',
         files: [{ filename: 'Music/Artist/Album/01 Song One.flac', size: 1 }],
       };
       const slskd = makeQueryAwareSlskdStub({
         'Artist Album': [partial],
-        Album: [fullAlbum],
+        '*rtist Album': [fullAlbum],
       });
 
       const hunter = new AlbumHunterService(slskd);
@@ -701,7 +694,7 @@ describe('AlbumHunterService', () => {
       const created = (slskd.searches.create as ReturnType<typeof mock>).mock.calls.map(
         (c) => c[0],
       );
-      expect(created).toContain('Album');
+      expect(created).toContain('*rtist Album');
     });
 
     it('de-dupes a folder seen in both base and skew, keeping the higher score', async () => {
@@ -713,7 +706,7 @@ describe('AlbumHunterService', () => {
       };
       const slskd = makeQueryAwareSlskdStub({
         'Artist Album': [samePartial],
-        Album: [fullAlbum],
+        '*rtist Album': [fullAlbum],
       });
 
       const hunter = new AlbumHunterService(slskd);
