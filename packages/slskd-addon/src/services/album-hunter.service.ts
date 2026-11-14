@@ -3,6 +3,8 @@ import {
   createLogger,
   baseQueries,
   buildSkewedQueries,
+  fileCarriesTitle,
+  normalizeCanonicalTitle,
   normalizeTitle,
   stripTitleQualifiers,
   titlesOverlap,
@@ -281,7 +283,7 @@ export function scoreFolders(
   }
 
   // Score each folder against canonical tracklist
-  const normalizedCanonical = canonicalTracks.map((t) => normalizeTitle(t.title));
+  const normalizedCanonical = canonicalTracks.map((t) => normalizeCanonicalTitle(t.title));
   // A single (exactly 1 canonical track) is scored with the qualifier-aware
   // strength (see SINGLE_PARTIAL_PCT) instead of the all-or-nothing matched/1
   // formula, keeping both the full and the qualifier-stripped "core" form.
@@ -321,10 +323,9 @@ export function scoreFolders(
       matched = strength > 0 ? 1 : 0;
       matchPct = strength;
     } else {
-      const normalizedFiles = baseNames.map(normalizeTitle);
       let m = 0;
       for (const canonicalTrack of normalizedCanonical) {
-        if (normalizedFiles.some((fn) => titlesOverlap(canonicalTrack, fn))) {
+        if (baseNames.some((n) => fileCarriesTitle(canonicalTrack, n))) {
           m++;
         }
       }
