@@ -388,6 +388,21 @@ describe('AlbumHunterService', () => {
       expect(candidates[0].username).toBe('alice');
     });
 
+    it('scores a clean rip of titles that start with a number at 100% (#1872)', () => {
+      const tracks = [
+        'Re-Hash', '5/4', 'Tomorrow Comes Today', 'New Genious (Brother)', 'Clint Eastwood',
+        'Man Research (Clapper)', 'Punk', 'Sound Check (Gravity)', 'Double Bass', 'Rock the House',
+        '19-2000', 'Latin Simone (¿Qué pasa contigo?)', 'Starshine', 'Slow Country', 'M1 A1',
+      ].map((title) => ({ title }));
+      const files = tracks.map((t, i) => ({
+        filename: `Music\\Gorillaz\\Gorillaz\\${String(i + 1).padStart(2, '0')} Gorillaz - ${t.title.replace('/', '_')}.mp3`,
+        size: 1,
+      }));
+      const [candidate] = scoreFolders(tracks, [{ username: 'peer', files }]);
+      expect(candidate.matchedTracks).toBe(15);
+      expect(candidate.matchPct).toBe(100);
+    });
+
     it('drops folders below the low match floor', () => {
       const candidates = scoreFolders(TRACKS, [
         {
