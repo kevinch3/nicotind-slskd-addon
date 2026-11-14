@@ -403,6 +403,29 @@ describe('AlbumHunterService', () => {
       expect(candidate.matchPct).toBe(100);
     });
 
+    it('counts a file that omits the bracketed subtitle (#1873)', () => {
+      const tracks = [
+        'Re-Hash', '5/4', 'Tomorrow Comes Today', 'New Genious (Brother)', 'Clint Eastwood',
+        'Man Research (Clapper)', 'Punk', 'Sound Check (Gravity)', 'Double Bass', 'Rock the House',
+        '19-2000', 'Latin Simone (¿Qué pasa contigo?)', 'Starshine', 'Slow Country', 'M1 A1',
+      ].map((title) => ({ title }));
+      const files = tracks.map((t, i) => ({
+        filename: `Music\\Gorillaz\\${String(i + 1).padStart(2, '0')}. ${t.title.replace(/ \(.*\)$/, '').replace('/', '-')}.mp3`,
+        size: 1,
+      }));
+      const [candidate] = scoreFolders(tracks, [{ username: 'peer', files }]);
+      expect(candidate.matchedTracks).toBe(15);
+      expect(candidate.matchPct).toBe(100);
+    });
+
+    it('lets one file stand for only one of "Song" and "Song (Reprise)" (#1873)', () => {
+      const tracks = [{ title: 'Song' }, { title: 'Song (Reprise)' }, { title: 'Other' }];
+      const [candidate] = scoreFolders(tracks, [
+        { username: 'p', files: [{ filename: 'A\\01 Song.mp3', size: 1 }, { filename: 'A\\02 Other.mp3', size: 1 }] },
+      ]);
+      expect(candidate.matchedTracks).toBe(2);
+    });
+
     it('drops folders below the low match floor', () => {
       const candidates = scoreFolders(TRACKS, [
         {
