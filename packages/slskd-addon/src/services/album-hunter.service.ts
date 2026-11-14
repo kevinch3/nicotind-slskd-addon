@@ -4,6 +4,7 @@ import {
   baseQueries,
   buildSkewedQueries,
   fileCarriesTitle,
+  fileCoreScore,
   normalizeCanonicalTitle,
   normalizeTitle,
   stripTitleQualifiers,
@@ -323,14 +324,8 @@ export function scoreFolders(
       matched = strength > 0 ? 1 : 0;
       matchPct = strength;
     } else {
-      let m = 0;
-      for (const canonicalTrack of normalizedCanonical) {
-        if (baseNames.some((n) => fileCarriesTitle(canonicalTrack, n))) {
-          m++;
-        }
-      }
-      matched = m;
-      matchPct = Math.round((m / (canonicalTracks.length || 1)) * 100);
+      matched = countMatchedTracks(canonicalTracks, normalizedCanonical, files, baseNames);
+      matchPct = Math.round((matched / (canonicalTracks.length || 1)) * 100);
     }
     if (matchPct < MIN_FLOOR_PCT) continue;
 
@@ -614,6 +609,39 @@ function extractDirectory(filename: string): string {
   const normalized = filename.replace(/\\/g, '/');
   const lastSlash = normalized.lastIndexOf('/');
   return lastSlash >= 0 ? normalized.slice(0, lastSlash) : '';
+}
+
+// How many canonical tracks a multi-track folder carries. A full title matches
+// any file, as before. A title still unmatched then gets its core (bracketed
+// subtitle dropped, NicotinD#1873) against the files no full title claimed, each
+// consumed once, so one "Song.flac" never stands for both "Song" and
+// "Song (Reprise)".
+function countMatchedTracks(
+  canonicalTracks: Array<{ title: string }>,
+  normalizedCanonical: string[],
+  files: HuntFile[],
+  baseNames: string[],
+): number {
+  const claimed = new Set<number>();
+  const unmatched: string[] = [];
+  normalizedCanonical.forEach((canonicalTrack, i) => {
+    let hit = false;
+    baseNames.forEach((n, f) => {
+      if (fileCarriesTitle(canonicalTrack, n)) {
+        hit = true;
+        claimed.add(f);
+      }
+    });
+    if (!hit) unmatched.push(canonicalTracks[i].title);
+  });
+  let matched = normalizedCanonical.length - unmatched.length;
+  for (const title of unmatched) {
+    const f = files.findIndex((file, idx) => !claimed.has(idx) && fileCoreScore(title, file.filename) > 0);
+    if (f < 0) continue;
+    claimed.add(f);
+    matched++;
+  }
+  return matched;
 }
 
 // Strength of a single (1-track) hunt match: 100 when the full normalized titles
