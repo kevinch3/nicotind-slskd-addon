@@ -169,6 +169,14 @@ export interface AlbumFallbackOptions {
    * genuinely dead peer is still abandoned quickly.
    */
   stallThresholdMs?: number;
+  /**
+   * How long the PRIMARY peer's transfers may make no byte progress before a
+   * recorded alternate may take their tracks (#38). Longer than
+   * `stallThresholdMs` because a Soulseek upload queue is a legitimate wait;
+   * shorter than the host's own stall trigger (10 min), so the cheap path runs
+   * first and its bytes keep the host from searching.
+   */
+  primaryStallThresholdMs?: number;
   /** Injectable clock for deterministic stall tests. */
   now?: () => number;
   /**
@@ -194,6 +202,7 @@ export class AlbumFallbackService {
   private exhaustedRetryCooldownMs: number;
   private exhaustedMaxRevives: number;
   private stallThresholdMs: number;
+  private primaryStallThresholdMs: number;
   private now: () => number;
   private isSourceReady: (() => Promise<boolean>) | null;
   /**
@@ -213,6 +222,7 @@ export class AlbumFallbackService {
     this.exhaustedRetryCooldownMs = options.exhaustedRetryCooldownMs ?? 3_600_000;
     this.exhaustedMaxRevives = options.exhaustedMaxRevives ?? 5;
     this.stallThresholdMs = options.stallThresholdMs ?? 120_000;
+    this.primaryStallThresholdMs = options.primaryStallThresholdMs ?? 300_000;
     this.now = options.now ?? Date.now;
     this.isSourceReady = options.isSourceReady ?? null;
   }
@@ -348,65 +358,24 @@ export class AlbumFallbackService {
       // fallback attempt on a duplicate pull.
       if (!recoverable.length) continue;
 
-      // Don't reach for a fallback while the primary peer is still trying.
-      if (this.primaryStillWorking(downloads, job, gaveUp)) continue;
+      // Don't reach for a fallback while the primary peer is still trying. A
+      // primary that has gone quiet may only be overtaken by a recorded
+      // alternate (#38).
+      const primary = this.primaryState(downloads, job, gaveUp);
+      if (primary.state === 'working') continue;
+      if (primary.state === 'stalled') {
+        await this.overtakeStalledPrimary(job, recoverable, canonical, primary.stalled);
+        continue;
+      }
 
       if (job.fallback_attempts >= this.maxFallbackAttempts) {
         this.setState(job.id, 'exhausted');
         continue;
       }
 
-      const alternates = JSON.parse(job.alternates_json) as AlternateCandidate[];
-      const picked = pickAlternate(alternates, recoverable, canonical);
-
       // Cheapest path first: pull from a recorded alternate folder if one covers
       // a missing track. Only when none does do we pay for a fresh network search.
-      if (picked) {
-        try {
-          await this.slskd.transfers.enqueue(picked.alternate.username, picked.files);
-        } catch (err) {
-          // The peer refused (typically offline). `pickAlternate` is
-          // deterministic, so leaving the alternate in place retried the same
-          // dead peer every sweep for ever — 6,344 times in 36 h on kpc (#15).
-          // Consume it and spend the attempt: the next sweep reaches the next
-          // peer, and a job with only dead peers still exhausts.
-          log.warn(
-            { jobId: job.id, from: picked.alternate.username, err },
-            'Alternate refused the enqueue; moving on to the next peer',
-          );
-          this.db.run(
-            'UPDATE album_jobs SET alternates_json = ?, fallback_attempts = fallback_attempts + 1 WHERE id = ?',
-            [JSON.stringify(alternates.filter((a) => a !== picked.alternate)), job.id],
-          );
-          continue;
-        }
-
-        log.info(
-          { jobId: job.id, from: picked.alternate.username, tracks: picked.files.length },
-          'Fallback: pulled missing tracks from an alternate peer',
-        );
-
-        // Keep the unified acquisition job pointing at the live transfers: the
-        // re-pulled tracks now come from the alternate's folder, so without
-        // this the feed/organizer would lose them (they no longer match the
-        // primary's stored keys). Best-effort.
-        this.repointAcquisitionItems(
-          job.id,
-          picked.alternate.username,
-          picked.files.map((f) => ({ filename: f.filename, bitRate: f.bitRate })),
-          recoverable,
-          canonical,
-          picked.alternate.audioFormat,
-        );
-
-        // Consume the used alternate and bump the attempt counter.
-        const remaining = alternates.filter((a) => a !== picked.alternate);
-        this.db.run(
-          'UPDATE album_jobs SET alternates_json = ?, fallback_attempts = fallback_attempts + 1 WHERE id = ?',
-          [JSON.stringify(remaining), job.id],
-        );
-        continue;
-      }
+      if ((await this.pullFromAlternate(job, recoverable, canonical)) !== null) continue;
 
       // No recorded alternate covers the gap. Legacy jobs (no artist recorded)
       // have nothing left to try — give up, preserving the old behavior.
@@ -618,28 +587,139 @@ export class AlbumFallbackService {
     return now - prev.since >= this.stallThresholdMs;
   }
 
-  private primaryStillWorking(
+  /**
+   * Pull the missing tracks from the best recorded alternate folder. Returns
+   * the enqueued filenames, `'refused'` when the peer turned the enqueue down
+   * (the alternate is consumed and the attempt spent), or null when no recorded
+   * alternate covers the gap.
+   */
+  private async pullFromAlternate(
+    job: AlbumJobRow,
+    recoverable: string[],
+    canonical: string[],
+  ): Promise<string[] | 'refused' | null> {
+    const alternates = JSON.parse(job.alternates_json) as AlternateCandidate[];
+    const picked = pickAlternate(alternates, recoverable, canonical);
+    if (!picked) return null;
+    const remaining = alternates.filter((a) => a !== picked.alternate);
+    try {
+      await this.slskd.transfers.enqueue(picked.alternate.username, picked.files);
+    } catch (err) {
+      // The peer refused (typically offline). `pickAlternate` is
+      // deterministic, so leaving the alternate in place retried the same
+      // dead peer every sweep for ever — 6,344 times in 36 h on kpc (#15).
+      // Consume it and spend the attempt: the next sweep reaches the next
+      // peer, and a job with only dead peers still exhausts.
+      log.warn(
+        { jobId: job.id, from: picked.alternate.username, err },
+        'Alternate refused the enqueue; moving on to the next peer',
+      );
+      this.db.run(
+        'UPDATE album_jobs SET alternates_json = ?, fallback_attempts = fallback_attempts + 1 WHERE id = ?',
+        [JSON.stringify(remaining), job.id],
+      );
+      return 'refused';
+    }
+
+    log.info(
+      { jobId: job.id, from: picked.alternate.username, tracks: picked.files.length },
+      'Fallback: pulled missing tracks from an alternate peer',
+    );
+
+    // Keep the unified acquisition job pointing at the live transfers: the
+    // re-pulled tracks now come from the alternate's folder, so without
+    // this the feed/organizer would lose them (they no longer match the
+    // primary's stored keys). Best-effort.
+    this.repointAcquisitionItems(
+      job.id,
+      picked.alternate.username,
+      picked.files.map((f) => ({ filename: f.filename, bitRate: f.bitRate })),
+      recoverable,
+      canonical,
+      picked.alternate.audioFormat,
+    );
+
+    // Consume the used alternate and bump the attempt counter.
+    this.db.run(
+      'UPDATE album_jobs SET alternates_json = ?, fallback_attempts = fallback_attempts + 1 WHERE id = ?',
+      [JSON.stringify(remaining), job.id],
+    );
+    return picked.files.map((f) => f.filename);
+  }
+
+  /** How long this transfer has gone without new bytes; 0 if never seen. */
+  private stalledFor(key: string): number {
+    const prev = this.progress.get(key);
+    return prev ? this.now() - prev.since : 0;
+  }
+
+  /**
+   * Is the primary peer still working the folder (`working`), sitting on
+   * transfers that have stopped moving (`stalled`, #38), or done with it
+   * (`idle`)? Any one moving or retryable file keeps it `working`.
+   */
+  private primaryState(
     downloads: Awaited<ReturnType<Slskd['transfers']['getDownloads']>>,
     job: AlbumJobRow,
     gaveUp: Set<string>,
-  ): boolean {
+  ): { state: 'working' | 'stalled' | 'idle'; stalled: Array<{ id: string; filename: string }> } {
+    const stalled: Array<{ id: string; filename: string }> = [];
     for (const group of downloads) {
       if (group.username !== job.username) continue;
       for (const dir of group.directories) {
         if (dir.directory !== job.directory) continue;
         for (const file of dir.files) {
-          if (ACTIVE_STATES.has(file.state)) return true;
+          if (ACTIVE_STATES.has(file.state)) {
+            const key = `${job.username}::${file.filename}`;
+            if (this.stalledFor(key) < this.primaryStallThresholdMs) {
+              return { state: 'working', stalled: [] };
+            }
+            stalled.push({ id: file.id, filename: file.filename });
+            continue;
+          }
           // An errored file the retry layer hasn't given up on yet is still in play.
           if (
             RETRYABLE_STATES.has(file.state) &&
             !gaveUp.has(`${job.username}::${file.filename}`)
           ) {
-            return true;
+            return { state: 'working', stalled: [] };
           }
         }
       }
     }
-    return false;
+    return { state: stalled.length ? 'stalled' : 'idle', stalled };
+  }
+
+  /**
+   * The primary peer went quiet without giving up (#38): hand its tracks to a
+   * recorded alternate, the cheap path, and cancel the frozen transfers they
+   * replace so a late wake-up cannot deliver a duplicate. No fresh search and
+   * no exhaustion here — the peer may still be queueing honestly, and the host
+   * runs its own search once the card has been still for longer.
+   */
+  private async overtakeStalledPrimary(
+    job: AlbumJobRow,
+    recoverable: string[],
+    canonical: string[],
+    stalled: Array<{ id: string; filename: string }>,
+  ): Promise<void> {
+    if (job.fallback_attempts >= this.maxFallbackAttempts) return;
+    const pulled = await this.pullFromAlternate(job, recoverable, canonical);
+    if (!Array.isArray(pulled)) return;
+    const taken = recoverable.filter(
+      (t) => unownedTargets([t], canonical, pulled.map(normalizeBasename)).length === 0,
+    );
+    for (const file of stalled) {
+      const owns = unownedTargets(taken, canonical, [normalizeBasename(file.filename)]);
+      if (owns.length === taken.length) continue;
+      await this.slskd.transfers.cancel(job.username, file.id).catch((err: unknown) => {
+        log.warn({ jobId: job.id, filename: file.filename, err }, 'Could not cancel a stalled transfer');
+      });
+    }
+    log.info(
+      { jobId: job.id, from: job.username, tracks: taken.length },
+      'Fallback: overtook a stalled primary peer',
+    );
   }
 
   private gaveUpKeys(): Set<string> {
