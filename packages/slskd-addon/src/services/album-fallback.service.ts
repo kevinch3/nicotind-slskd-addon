@@ -356,8 +356,9 @@ export class AlbumFallbackService {
         continue;
       }
 
+      const wanted = titlesForTargets(job, recoverable, canonical);
       const alternates = JSON.parse(job.alternates_json) as AlternateCandidate[];
-      const picked = pickAlternate(alternates, recoverable, canonical);
+      const picked = pickAlternate(alternates, wanted, canonical);
 
       // Cheapest path first: pull from a recorded alternate folder if one covers
       // a missing track. Only when none does do we pay for a fresh network search.
@@ -394,7 +395,7 @@ export class AlbumFallbackService {
           job.id,
           picked.alternate.username,
           picked.files.map((f) => ({ filename: f.filename, bitRate: f.bitRate })),
-          recoverable,
+          wanted,
           canonical,
           picked.alternate.audioFormat,
         );
@@ -420,7 +421,7 @@ export class AlbumFallbackService {
       const enqueued = await this.recoverViaFreshSearch(
         job.id,
         job.artist_name,
-        recoverable,
+        wanted,
         canonical,
       );
       // Count the wave as an attempt either way so a hopeless gap eventually
@@ -728,6 +729,29 @@ export class AlbumFallbackService {
 function unownedTargets(targets: string[], canonical: string[], owned: string[]): string[] {
   const missing = new Set(titlesMissingFromOwned([...targets, ...canonical], owned));
   return targets.filter((t) => missing.has(t));
+}
+
+/**
+ * The canonical title each recoverable target names. A manifest target is a
+ * normalized basename ("red hot chili peppers by the way 06 the zephyr song"):
+ * no alternate file matches it once the tracklist competes, a search for it
+ * finds little, and it keys no job item — so a recovered track never reached
+ * its item and the job stayed active for ever (#36). Matched from the raw
+ * filename, whose separators the matcher needs.
+ */
+function titlesForTargets(job: AlbumJobRow, recoverable: string[], canonical: string[]): string[] {
+  if (!job.target_files_json || !canonical.length) return recoverable;
+  const wanted = new Set(recoverable);
+  const files = (JSON.parse(job.target_files_json) as string[])
+    .filter((f) => wanted.has(normalizeBasename(f)))
+    .map((filename) => ({ filename }));
+  const titleOf = new Map(
+    matchFilesToTitles(files, canonical).map((m) => [
+      normalizeBasename(m.file.filename),
+      normalizeTitle(m.title),
+    ]),
+  );
+  return [...new Set(recoverable.map((t) => titleOf.get(t) ?? t))];
 }
 
 function parseTargets(job: AlbumJobRow): string[] {
