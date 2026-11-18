@@ -188,3 +188,57 @@ describe('addon fallback host — exhausted closure', () => {
     expect(job.state).toBe('partial');
   });
 });
+
+describe('addon fallback host — repoint reaches the item (#36)', () => {
+  it('repoints the item when the folder names files "Artist - Album - NN - Title"', async () => {
+    const db = new Database(':memory:');
+    applySchema(db);
+    const { createAddonJob, addJobItems, getAddonJob, itemIdForTitle } =
+      await import('./job-store.js');
+    const { makeAddonFallbackHost } = await import('./addon-fallback-host.js');
+    const canonical = ['By the Way', 'The Zephyr Song', "Can't Stop"];
+    const primaryFile =
+      'music\\Red Hot Chili Peppers\\2002 - By the Way\\Red Hot Chili Peppers - By the Way - 06 - The Zephyr Song.flac';
+    const albumJobId = AlbumFallbackService.recordJob(db, {
+      lidarrAlbumId: null,
+      username: 'primary',
+      directory: 'music/Red Hot Chili Peppers/2002 - By the Way',
+      artistName: 'Red Hot Chili Peppers',
+      albumTitle: 'By the Way',
+      canonicalTracks: canonical,
+      targetFiles: [{ filename: primaryFile }],
+      alternates: [
+        {
+          username: 'alt',
+          directory: 'Music/By the Way',
+          audioFormat: 'FLAC',
+          files: [
+            { filename: 'Music\\By the Way\\Red Hot Chili Peppers - By the Way - 06 The Zephyr Song.flac', size: 1 },
+          ],
+        },
+      ],
+    });
+    createAddonJob(db, { id: 'aj-btw', intent: 'album', albumJobId });
+    addJobItems(db, 'aj-btw', [
+      {
+        itemId: itemIdForTitle('The Zephyr Song'),
+        title: 'The Zephyr Song',
+        username: 'primary',
+        filename: primaryFile,
+        size: 1,
+      },
+    ]);
+
+    // The primary aborted and is idle: the sweep pulls the track from `alt`.
+    const enqueued: unknown[] = [];
+    await new AlbumFallbackService(slskdWith([], enqueued), {
+      db,
+      host: makeAddonFallbackHost(db),
+    }).sweep();
+
+    expect(enqueued).toHaveLength(1);
+    const item = getAddonJob(db, 'aj-btw')!.items[0]!;
+    expect(item.username).toBe('alt');
+    expect(item.filename).toContain('06 The Zephyr Song');
+  });
+});

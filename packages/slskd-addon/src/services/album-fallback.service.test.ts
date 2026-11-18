@@ -360,6 +360,47 @@ describe('AlbumFallbackService', () => {
     expect(jobState(db)).toBe('active');
   });
 
+  it('searches and repoints by the track title when the folder prefixes artist and album (#36)', async () => {
+    const primaryFile =
+      'music\\Red Hot Chili Peppers\\2002 - By the Way\\Red Hot Chili Peppers - By the Way - 06 - The Zephyr Song.flac';
+    const { slskd, create } = makeSlskdWithSearch(
+      [],
+      [
+        {
+          username: 'freshpeer',
+          freeUploadSlots: 1,
+          queueLength: 0,
+          uploadSpeed: 1000,
+          files: [{ filename: 'RHCP\\06 The Zephyr Song.flac', size: 1 }],
+        },
+      ],
+    );
+    AlbumFallbackService.recordJob(db, {
+      lidarrAlbumId: null,
+      username: 'primary',
+      directory: 'music/Red Hot Chili Peppers/2002 - By the Way',
+      artistName: 'Red Hot Chili Peppers',
+      albumTitle: 'By the Way',
+      canonicalTracks: ['By the Way', 'The Zephyr Song', 'Can’t Stop'],
+      targetFiles: [{ filename: primaryFile }],
+      alternates: [],
+    });
+    const repoints: Array<{ title: string }> = [];
+    const host = {
+      ...NOOP_FALLBACK_HOST,
+      repointItems: (_id: number, _u: string, items: Array<{ title: string }>) => {
+        repoints.push(...items);
+      },
+    };
+
+    await new AlbumFallbackService(slskd, { db, host }).sweep();
+
+    expect(create).toHaveBeenCalledWith('Red Hot Chili Peppers the zephyr song', {
+      searchTimeoutMs: 8000,
+    });
+    expect(repoints.map((r) => r.title)).toEqual(['the zephyr song']);
+  });
+
   it('fresh search prefers the clean studio track over a (5.1 mix) from a healthier peer', async () => {
     const { slskd, enqueue } = makeSlskdWithSearch(
       [
