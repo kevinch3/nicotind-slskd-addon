@@ -27,12 +27,14 @@ export function makeAddonFallbackHost(db: Database): FallbackHost {
         return;
       }
       for (const { title, filename, bitRate } of items) {
-        repointJobItem(db, jobId, itemIdForTitle(title), {
+        const itemId = itemIdForTitle(title);
+        const moved = repointJobItem(db, jobId, itemId, {
           username,
           filename,
           bitRateKbps: bitRate,
           audioFormat,
         });
+        if (!moved) log.warn({ jobId, itemId, filename }, 'Repoint matched no job item');
       }
     },
 

@@ -126,9 +126,9 @@ export function repointJobItem(
   jobId: string,
   itemId: string,
   next: { username: string; filename: string; bitRateKbps?: number; audioFormat?: string },
-): void {
+): boolean {
   const now = Date.now();
-  db.run(
+  const { changes } = db.run(
     `UPDATE addon_job_items
      SET username = ?, filename = ?, bit_rate_kbps = COALESCE(?, bit_rate_kbps),
          audio_format = COALESCE(?, audio_format), state = 'queued',
@@ -145,6 +145,7 @@ export function repointJobItem(
     ],
   );
   touchJob(db, jobId, now);
+  return changes > 0;
 }
 
 export function setItemState(
