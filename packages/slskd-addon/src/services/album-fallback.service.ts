@@ -6,7 +6,7 @@ import {
   normalizeTitle,
   titlesMissingFromOwned,
 } from '@nicotind/addon-sdk';
-import type { Slskd } from '@nicotind/slskd-client';
+import { SlskdRequestError, type Slskd } from '@nicotind/slskd-client';
 import type { Database } from 'bun:sqlite';
 
 import { SearchLanes } from './search-lanes.js';
@@ -590,14 +590,15 @@ export class AlbumFallbackService {
   /**
    * Pull the missing tracks from the best recorded alternate folder. Returns
    * the enqueued filenames, `'refused'` when the peer turned the enqueue down
-   * (the alternate is consumed and the attempt spent), or null when no recorded
+   * (the alternate is consumed and the attempt spent), `'unreachable'` when
+   * slskd never answered (nothing is spent), or null when no recorded
    * alternate covers the gap.
    */
   private async pullFromAlternate(
     job: AlbumJobRow,
     recoverable: string[],
     canonical: string[],
-  ): Promise<string[] | 'refused' | null> {
+  ): Promise<string[] | 'refused' | 'unreachable' | null> {
     const alternates = JSON.parse(job.alternates_json) as AlternateCandidate[];
     const picked = pickAlternate(alternates, recoverable, canonical);
     if (!picked) return null;
@@ -605,6 +606,13 @@ export class AlbumFallbackService {
     try {
       await this.slskd.transfers.enqueue(picked.alternate.username, picked.files);
     } catch (err) {
+      // No HTTP status: slskd itself never answered, which says nothing about
+      // the peer. Keep the alternate rather than burn the list through an
+      // outage (#13).
+      if (!(err instanceof SlskdRequestError)) {
+        log.warn({ jobId: job.id, err }, 'Fallback enqueue failed; will retry next sweep');
+        return 'unreachable';
+      }
       // The peer refused (typically offline). `pickAlternate` is
       // deterministic, so leaving the alternate in place retried the same
       // dead peer every sweep for ever — 6,344 times in 36 h on kpc (#15).

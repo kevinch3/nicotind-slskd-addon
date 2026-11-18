@@ -6,7 +6,7 @@ import {
   NOOP_FALLBACK_HOST,
   type AlternateCandidate,
 } from './album-fallback.service.js';
-import type { Slskd } from '@nicotind/slskd-client';
+import { SlskdRequestError, type Slskd } from '@nicotind/slskd-client';
 import type { SearchLanes } from './search-lanes.js';
 
 interface MockFile {
@@ -882,7 +882,9 @@ describe('AlbumFallbackService — offline peers and ownerless jobs (#15)', () =
     // slskd answers a peer that is offline with a 500 (`UserOfflineException`);
     // on kpc this was retried against the same peer every 15 s, 6,344 times.
     enqueue.mockImplementation(async (username: string) => {
-      if (username === 'alt') throw new Error('slskd request failed: 500 /transfers/downloads/alt');
+      if (username === 'alt') {
+        throw new SlskdRequestError('slskd request failed: 500', 500, '/transfers/downloads/alt');
+      }
     });
     primaryGaveUp();
     recordJob(db, [ALT, ALT2]);
@@ -895,6 +897,23 @@ describe('AlbumFallbackService — offline peers and ownerless jobs (#15)', () =
 
     await svc.sweep();
     expect(enqueue.mock.calls.map((c) => c[0])).toEqual(['alt', 'alt2']);
+    expect(jobState(db)).toBe('active');
+  });
+
+  it('keeps the alternate when slskd itself never answered (#13)', async () => {
+    const { slskd, enqueue } = makeSlskd(PRIMARY_GAVE_UP);
+    enqueue.mockImplementation(async () => {
+      throw new Error('connect ECONNREFUSED 127.0.0.1:5030');
+    });
+    primaryGaveUp();
+    recordJob(db, [ALT, ALT2]);
+
+    const svc = new AlbumFallbackService(slskd, { db, host: NOOP_FALLBACK_HOST });
+    await svc.sweep();
+    await svc.sweep();
+    expect(enqueue.mock.calls.map((c) => c[0])).toEqual(['alt', 'alt']);
+    expect(attempts(db)).toBe(0);
+    expect(alternates()).toEqual(['alt', 'alt2']);
     expect(jobState(db)).toBe('active');
   });
 

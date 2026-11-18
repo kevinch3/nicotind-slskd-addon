@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, mock } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import type { Slskd } from '@nicotind/slskd-client';
+import { SlskdRequestError, type Slskd } from '@nicotind/slskd-client';
 import { applySchema } from '../db.js';
 import {
   AlbumFallbackService,
@@ -175,7 +175,7 @@ describe('a stalled primary peer (#38)', () => {
   it('keeps the frozen primary when the alternate refuses the enqueue', async () => {
     const { slskd, enqueue, cancel } = stuckPrimary(() => 50);
     enqueue.mockImplementation(async () => {
-      throw new Error('User is offline');
+      throw new SlskdRequestError('slskd request failed: 500', 500, '/transfers/downloads/alt');
     });
     recordJob([ALT]);
     const clock = { t: 1_000 };
