@@ -475,4 +475,38 @@ describe('addon protocol routes', () => {
     expect(second.id).toBe(first.id);
     expect(h.state.enqueued).toHaveLength(1);
   });
+
+  // NicotinD#1507: the key outlived its job. A delete made the replay
+  // `{ job: null }`, a cancel made it a dead job; both must start afresh.
+  describe('a key whose job is no longer running', () => {
+    const req = () =>
+      h.app.request('/addon/v1/jobs', {
+        method: 'POST',
+        headers: { ...AUTH, 'Content-Type': 'application/json', 'Idempotency-Key': 'k2' },
+        body: JSON.stringify({
+          intent: 'browse-grab',
+          username: 'goodpeer',
+          files: [{ filename: 'Music\\Loose\\Track.mp3', size: 5 }],
+        }),
+      });
+
+    it('starts a new job once the old one was deleted', async () => {
+      const first = ((await (await req()).json()) as { job: AddonJob }).job;
+      await h.app.request(`/addon/v1/jobs/${first.id}`, { method: 'DELETE', headers: AUTH });
+      const res = await req();
+      expect(res.status).toBe(201);
+      const second = ((await res.json()) as { job: AddonJob | null }).job;
+      expect(second).not.toBeNull();
+      expect(second!.id).not.toBe(first.id);
+      expect(h.state.enqueued).toHaveLength(2);
+    });
+
+    it('starts a new job once the old one was cancelled', async () => {
+      const first = ((await (await req()).json()) as { job: AddonJob }).job;
+      await h.app.request(`/addon/v1/jobs/${first.id}/cancel`, { method: 'POST', headers: AUTH });
+      const second = ((await (await req()).json()) as { job: AddonJob }).job;
+      expect(second.id).not.toBe(first.id);
+      expect(second.state).toBe('active');
+    });
+  });
 });
