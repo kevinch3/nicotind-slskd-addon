@@ -6,6 +6,20 @@ import { existsSync } from 'node:fs';
 
 /** How long an unresolved completion keeps being looked for on disk. */
 const LATE_ARRIVAL_WINDOW_MS = 7 * 24 * 3_600_000;
+/**
+ * Completions this young are looked for on every tick: slskd flips a transfer
+ * to succeeded while it is still moving the file out of `incomplete/`, and that
+ * move takes seconds (#17).
+ */
+const LATE_ARRIVAL_HOT_MS = 15 * 60_000;
+/**
+ * The rest of the window is swept this often, not every tick. Re-reading a week
+ * of completions that never resolved (3,975 rows on prod, none resolvable) and
+ * trying each one's candidate paths every 5 s was where the addon's memory went:
+ * ~15 MiB a minute of native growth, a restart at the cap every few hours
+ * (NicotinD#1137).
+ */
+const LATE_ARRIVAL_COLD_SWEEP_MS = 30 * 60_000;
 
 const log = createLogger('transfer-poller');
 
@@ -31,6 +45,8 @@ export interface TransferPollerOptions {
   /** Where slskd lands completed files locally (path resolution root). */
   rootDir?: string | null;
   onCompleted: (files: PolledCompletion[]) => void | Promise<void>;
+  /** Clock for the late-arrival cadence; tests step it. */
+  now?: () => number;
 }
 
 /**
@@ -50,6 +66,9 @@ export class TransferPoller {
   private timer: ReturnType<typeof setInterval> | null = null;
   private knownCompleted = new Set<string>();
   private checking = false;
+  private now: () => number;
+  /** 0 so the first tick after a start sweeps the whole window once. */
+  private lastColdSweepAt = 0;
 
   constructor(slskd: Slskd, options: TransferPollerOptions) {
     this.slskd = slskd;
@@ -57,6 +76,7 @@ export class TransferPoller {
     this.intervalMs = options.intervalMs ?? 5_000;
     this.rootDir = options.rootDir ? expandDir(options.rootDir) : null;
     this.onCompleted = options.onCompleted;
+    this.now = options.now ?? Date.now;
   }
 
   start(): void {
@@ -233,7 +253,7 @@ export class TransferPoller {
              FROM completed_downloads
             WHERE relative_path IS NULL AND COALESCE(completed_at, 0) > ?`,
         )
-        .all(Date.now() - LATE_ARRIVAL_WINDOW_MS);
+        .all(this.lateArrivalSince());
     } catch {
       return;
     }
@@ -261,6 +281,14 @@ export class TransferPoller {
       log.info({ username: row.username, filename: row.filename }, 'Download resolved on disk late');
     }
     if (arrived.length) await this.onCompleted(arrived);
+  }
+
+  /** The oldest completion this tick looks for: the hot window, or the whole one when a sweep is due. */
+  private lateArrivalSince(): number {
+    const now = this.now();
+    if (now - this.lastColdSweepAt < LATE_ARRIVAL_COLD_SWEEP_MS) return now - LATE_ARRIVAL_HOT_MS;
+    this.lastColdSweepAt = now;
+    return now - LATE_ARRIVAL_WINDOW_MS;
   }
 
   private resolveRelativePath(directory: string, filename: string): string | null {
