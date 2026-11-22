@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { dirname } from 'node:path';
 import type { Database } from 'bun:sqlite';
 import type { Slskd } from '@nicotind/slskd-client';
 import { createLogger, type AddonHealth, type AddonStatusRow } from '@nicotind/addon-sdk';
@@ -6,6 +7,7 @@ import { buildManifest } from './manifest.js';
 import { storeConfig } from './config.js';
 import { createProtocolRoutes, type ProtocolRouteDeps } from './routes.js';
 import { SourceConnection } from './services/source-connection.js';
+import { memoryReport, writeHeapSnapshot } from './services/memory-debug.js';
 
 const log = createLogger('slskd-addon');
 
@@ -26,6 +28,8 @@ export interface AddonServerDeps {
   engine?: Pick<ProtocolRouteDeps, 'hunter' | 'trackHunter' | 'downloadsDir'>;
   /** Shared readiness probe + reconnect kicker; constructed here when absent. */
   sourceConnection?: SourceConnection;
+  /** Where `POST /debug/heap` writes snapshots; defaults to the job ledger's directory. */
+  debugDir?: string;
 }
 
 /**
@@ -76,6 +80,18 @@ export function createAddonApp(deps: AddonServerDeps): Hono {
       log.warn({ err }, 'status probe failed');
       return c.json([] satisfies AddonStatusRow[]);
     }
+  });
+
+  // Inside-the-process memory, behind the bearer like everything here
+  // (NicotinD#1137). Two `/debug/memory` reads some minutes apart say whether
+  // the growth is JavaScript objects (and which) or native memory.
+  v1.get('/debug/memory', (c) => c.json(memoryReport()));
+  v1.post('/debug/heap', async (c) => {
+    const dir =
+      deps.debugDir ?? dirname(process.env.SLSKD_ADDON_DB ?? 'data/slskd-addon.sqlite');
+    const path = await writeHeapSnapshot(dir);
+    log.info({ path }, 'wrote a heap snapshot');
+    return c.json({ path, ...memoryReport(10) });
   });
 
   v1.put('/config', async (c) => {
