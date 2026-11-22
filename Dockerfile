@@ -1,6 +1,8 @@
 # The slskd acquisition addon — NicotinD acquisition addon protocol v1.
 # Build from the repo root: docker build -t nicotind-slskd-addon .
-FROM oven/bun:1.3.14
+# Pinned to 1.3.11 as an experiment (NicotinD#1137): on 1.3.14 the process's RSS grows ~15 MiB/min
+# while its JS heap stays flat, i.e. native memory; one-at-a-time fetches stayed flat on 1.3.11.
+FROM oven/bun:1.3.11
 
 WORKDIR /app
 
