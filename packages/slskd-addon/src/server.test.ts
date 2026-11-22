@@ -134,3 +134,51 @@ describe('addon server (protocol v1 base routes)', () => {
     expect(notified).toBe(1);
   });
 });
+
+describe('memory debugging (NicotinD#1137)', () => {
+  it('keeps both debug routes behind the bearer', async () => {
+    const { app } = makeApp();
+    expect((await app.request('/addon/v1/debug/memory')).status).toBe(401);
+    expect((await app.request('/addon/v1/debug/heap', { method: 'POST' })).status).toBe(401);
+  });
+
+  it('reports process and heap figures with the most numerous object types', async () => {
+    const { app } = makeApp();
+    const res = await app.request('/addon/v1/debug/memory', {
+      headers: { authorization: 'Bearer tok' },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      rss: number;
+      heapSize: number;
+      topTypes: Array<[string, number]>;
+    };
+    expect(body.rss).toBeGreaterThan(body.heapSize);
+    expect(body.topTypes.length).toBeGreaterThan(0);
+    // Largest first, so the head of the list is what a diff reads.
+    expect(body.topTypes[0]![1]).toBeGreaterThanOrEqual(body.topTypes.at(-1)![1]);
+  });
+
+  it('writes a V8 heap snapshot DevTools can open, and says where', async () => {
+    const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const dir = mkdtempSync(join(tmpdir(), 'addon-heap-'));
+    try {
+      const db = new Database(':memory:');
+      applySchema(db);
+      const app = createAddonApp({ db, slskdRef: { current: stubSlskd() }, token: 'tok', debugDir: dir });
+      const res = await app.request('/addon/v1/debug/heap', {
+        method: 'POST',
+        headers: { authorization: 'Bearer tok' },
+      });
+      expect(res.status).toBe(200);
+      const { path } = (await res.json()) as { path: string };
+      expect(path.startsWith(dir)).toBe(true);
+      const snapshot = JSON.parse(readFileSync(path, 'utf8')) as { snapshot?: { meta?: unknown } };
+      expect(snapshot.snapshot?.meta).toBeDefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

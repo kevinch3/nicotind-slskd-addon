@@ -97,6 +97,22 @@ bun run gen:schema  # regenerate the published JSON Schema from the Zod DTOs
 CI (`.github/workflows/ci.yml`) runs typecheck + test and builds the image, publishing
 `ghcr.io/kevinch3/nicotind-slskd-addon` on pushes to `main` and version tags.
 
+## Debugging memory
+
+Two authenticated routes look inside the running process (NicotinD#1137):
+
+```bash
+# RSS, JS heap and the 30 most numerous object types. Read it twice, minutes apart:
+# rss climbing with heapSize flat means native memory; a climbing topTypes count names the culprit.
+curl -s -H "Authorization: Bearer $SLSKD_ADDON_TOKEN" http://127.0.0.1:8585/addon/v1/debug/memory
+
+# A V8 heap snapshot for Chrome DevTools' Memory tab, written beside the job ledger.
+curl -s -X POST -H "Authorization: Bearer $SLSKD_ADDON_TOKEN" http://127.0.0.1:8585/addon/v1/debug/heap
+```
+
+A snapshot of a large heap is itself large, so take it while the container is well below its memory
+cap: two snapshots some 30 minutes apart, compared in DevTools, show what accumulated.
+
 ## License
 
 AGPL-3.0-only, matching NicotinD.
