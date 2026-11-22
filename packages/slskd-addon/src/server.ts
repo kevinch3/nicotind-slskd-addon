@@ -30,6 +30,8 @@ export interface AddonServerDeps {
   sourceConnection?: SourceConnection;
   /** Where `POST /debug/heap` writes snapshots; defaults to the job ledger's directory. */
   debugDir?: string;
+  /** Background loops `/debug/pollers` may stop and start at runtime, by name (NicotinD#1137). */
+  pollers?: Record<string, { start(): void; stop(): void }>;
 }
 
 /**
@@ -92,6 +94,41 @@ export function createAddonApp(deps: AddonServerDeps): Hono {
     const path = await writeHeapSnapshot(dir);
     log.info({ path }, 'wrote a heap snapshot');
     return c.json({ path, ...memoryReport(10) });
+  });
+
+  // Is the growth garbage nobody collects, or a real leak? Native memory Bun
+  // does not report to the collector only comes back when a full GC runs, and
+  // a small heap rarely triggers one (NicotinD#1137).
+  v1.post('/debug/gc', async (c) => {
+    const before = memoryReport(5);
+    Bun.gc(true);
+    await new Promise((r) => setTimeout(r, 50));
+    return c.json({ before, after: memoryReport(5) });
+  });
+
+  // Bisect the steady traffic without a redeploy: stop one loop, read
+  // `/debug/memory` twice, start it again. A restart starts everything.
+  const pollers = deps.pollers ?? {};
+  const stopped = new Set<string>();
+  v1.get('/debug/pollers', (c) =>
+    c.json(Object.keys(pollers).map((name) => ({ name, running: !stopped.has(name) }))),
+  );
+  v1.post('/debug/pollers/:name/:action', (c) => {
+    const name = c.req.param('name');
+    const action = c.req.param('action');
+    const poller = pollers[name];
+    if (!poller) return c.json({ error: `unknown poller: ${name}` }, 404);
+    if (action === 'stop') {
+      poller.stop();
+      stopped.add(name);
+    } else if (action === 'start') {
+      if (stopped.has(name)) poller.start();
+      stopped.delete(name);
+    } else {
+      return c.json({ error: 'action must be stop or start' }, 400);
+    }
+    log.warn({ name, action }, 'debug: poller toggled');
+    return c.json({ name, running: !stopped.has(name) });
   });
 
   v1.put('/config', async (c) => {
