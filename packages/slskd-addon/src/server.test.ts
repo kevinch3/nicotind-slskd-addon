@@ -182,3 +182,56 @@ describe('memory debugging (NicotinD#1137)', () => {
     }
   });
 });
+
+describe('debug: forced GC and poller toggles (NicotinD#1137)', () => {
+  const auth = { authorization: 'Bearer tok' };
+  function appWith(pollers: Record<string, { start(): void; stop(): void }>) {
+    const db = new Database(':memory:');
+    applySchema(db);
+    return createAddonApp({ db, slskdRef: { current: stubSlskd() }, token: 'tok', pollers });
+  }
+
+  it('reports memory before and after a full collection', async () => {
+    const res = await appWith({}).request('/addon/v1/debug/gc', { method: 'POST', headers: auth });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { before: { rss: number }; after: { rss: number } };
+    expect(body.before.rss).toBeGreaterThan(0);
+    expect(body.after.rss).toBeGreaterThan(0);
+  });
+
+  it('stops and starts a named poller, and lists its state', async () => {
+    const calls: string[] = [];
+    const app = appWith({
+      'transfer-poller': { start: () => calls.push('start'), stop: () => calls.push('stop') },
+    });
+    const post = (path: string) => app.request(path, { method: 'POST', headers: auth });
+
+    expect(await (await post('/addon/v1/debug/pollers/transfer-poller/stop')).json()).toEqual({
+      name: 'transfer-poller',
+      running: false,
+    });
+    expect(
+      await (await app.request('/addon/v1/debug/pollers', { headers: auth })).json(),
+    ).toEqual([{ name: 'transfer-poller', running: false }]);
+    await post('/addon/v1/debug/pollers/transfer-poller/start');
+    // Starting one that runs already is a no-op, not a second timer.
+    await post('/addon/v1/debug/pollers/transfer-poller/start');
+    expect(calls).toEqual(['stop', 'start']);
+  });
+
+  it('refuses an unknown poller, a bad action, and a caller without the bearer', async () => {
+    const app = appWith({ retry: { start: () => {}, stop: () => {} } });
+    expect(
+      (await app.request('/addon/v1/debug/pollers/nope/stop', { method: 'POST', headers: auth }))
+        .status,
+    ).toBe(404);
+    expect(
+      (await app.request('/addon/v1/debug/pollers/retry/pause', { method: 'POST', headers: auth }))
+        .status,
+    ).toBe(400);
+    expect((await app.request('/addon/v1/debug/pollers/retry/stop', { method: 'POST' })).status).toBe(
+      401,
+    );
+    expect((await app.request('/addon/v1/debug/gc', { method: 'POST' })).status).toBe(401);
+  });
+});

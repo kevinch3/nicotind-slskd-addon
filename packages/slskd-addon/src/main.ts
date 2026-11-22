@@ -137,6 +137,7 @@ const app = createAddonApp({
   sourceConnection,
   token: config.token,
   statusRows,
+  pollers: { 'transfer-poller': poller, retry, retention },
   onConfigChanged: () => {
     config = resolveConfig(db);
     slskdRef.current = makeSlskd();

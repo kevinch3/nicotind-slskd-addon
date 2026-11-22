@@ -113,6 +113,20 @@ curl -s -X POST -H "Authorization: Bearer $SLSKD_ADDON_TOKEN" http://127.0.0.1:8
 A snapshot of a large heap is itself large, so take it while the container is well below its memory
 cap: two snapshots some 30 minutes apart, compared in DevTools, show what accumulated.
 
+Two more, for a growth that is native rather than JavaScript:
+
+```bash
+# Force a full collection and see what it gives back. A large drop means garbage the collector
+# was not being asked to free (native buffers it does not count), not a leak.
+curl -s -X POST -H "Authorization: Bearer $SLSKD_ADDON_TOKEN" http://127.0.0.1:8585/addon/v1/debug/gc
+
+# Stop one background loop (transfer-poller, retry, retention), read /debug/memory twice, start it again.
+curl -s -X POST -H "Authorization: Bearer $SLSKD_ADDON_TOKEN" http://127.0.0.1:8585/addon/v1/debug/pollers/transfer-poller/stop
+curl -s -H "Authorization: Bearer $SLSKD_ADDON_TOKEN" http://127.0.0.1:8585/addon/v1/debug/pollers
+```
+
+A stopped loop stays stopped until it is started again or the container restarts.
+
 ## License
 
 AGPL-3.0-only, matching NicotinD.
