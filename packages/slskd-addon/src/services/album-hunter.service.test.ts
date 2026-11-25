@@ -2,6 +2,7 @@ import { describe, it, expect, mock } from 'bun:test';
 import { SlskdRequestError, type Slskd } from '@nicotind/slskd-client';
 import {
   AlbumHunterService,
+  attributeBaseCandidates,
   buildSkewedQueries,
   normalizeTitle,
   isBloatedFolder,
@@ -990,5 +991,33 @@ describe('a lone retry query fills both lanes (#31)', () => {
     expect(res.queries).toEqual(['Gorillaz Gorillaz', 'Gorillaz - Gorillaz', '*orillaz *orillaz']);
     expect(res.searchesFired).toBe(3);
     expect(res.candidates[0]?.files.length).toBe(GORILLAZ.length);
+  });
+});
+
+describe('attributeBaseCandidates (#25)', () => {
+  const c = (username: string, directory: string, matchPct: number) =>
+    ({ username, directory, matchPct }) as unknown as Parameters<typeof attributeBaseCandidates>[0][0][0];
+
+  it('counts the folders each base query found alone, and how good the second-only ones were', () => {
+    expect(
+      attributeBaseCandidates([
+        [c('a', 'X', 100), c('b', 'Y', 80)],
+        [c('a', 'X', 100), c('c', 'Z', 67), c('d', 'W', 33)],
+      ]),
+    ).toEqual({ onlyFirst: 1, onlySecond: 2, both: 1, onlySecondBestPct: 67 });
+  });
+
+  it('two identical answers attribute nothing to the second query', () => {
+    const same = [c('a', 'X', 100)];
+    expect(attributeBaseCandidates([same, same])).toEqual({
+      onlyFirst: 0,
+      onlySecond: 0,
+      both: 1,
+      onlySecondBestPct: 0,
+    });
+  });
+
+  it('is only defined for the base pair', () => {
+    expect(attributeBaseCandidates([[c('a', 'X', 100)]])).toBeNull();
   });
 });
