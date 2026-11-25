@@ -12,6 +12,7 @@ import {
 } from '@nicotind/addon-sdk';
 import { SourceConnection } from './source-connection.js';
 import { SearchLanes } from './search-lanes.js';
+import { retireSearch } from './search-retire.js';
 
 // Re-export the shared query builders so existing importers (track-pick, tests,
 // callers) keep their `./album-hunter.service` import path — the canonical source
@@ -596,9 +597,10 @@ export class AlbumHunterService {
       return { responses, fired: queries.length, answered, rateLimited, sourceOffline };
     } finally {
       // Clean up searches (bounded — the same burst that 429s creates also 429s
-      // deletes, and leaked searches pile up in slskd's history).
+      // deletes, and leaked searches pile up in slskd's history). A search still
+      // running is cancelled and let finish first (#23).
       await mapPool(searchIds, SEARCH_LANES, (id) =>
-        this.slskd.searches.delete(id).catch(() => {}),
+        retireSearch(this.slskd, id, { pollMs: this.pollIntervalMs }),
       );
     }
   }
