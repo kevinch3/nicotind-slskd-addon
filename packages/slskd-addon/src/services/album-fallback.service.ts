@@ -253,8 +253,27 @@ export class AlbumFallbackService {
     return row?.id ?? 0;
   }
 
-  /** One reconciliation pass. Public so tests can drive it deterministically. */
-  async sweep(): Promise<void> {
+  private inFlight: Promise<void> | null = null;
+
+  /**
+   * One reconciliation pass. Public so tests can drive it deterministically.
+   *
+   * Single-flight: a call made while a pass is running joins that pass rather
+   * than starting a second one. The retry tick fires every 15 s and a pass with
+   * fresh per-track searches outlasts it, and two overlapping passes both read
+   * the job list before either wrote: on kpc one job spent 6 of its 3 fallback
+   * attempts and another was abandoned 20 times (#27).
+   */
+  sweep(): Promise<void> {
+    if (!this.inFlight) {
+      this.inFlight = this.sweepOnce().finally(() => {
+        this.inFlight = null;
+      });
+    }
+    return this.inFlight;
+  }
+
+  private async sweepOnce(): Promise<void> {
     // First give long-exhausted jobs (peers may now be back online) another shot
     // by flipping eligible ones back to 'active' — they're then swept this pass.
     if (this.autoRetryExhausted) this.reviveExhausted();
