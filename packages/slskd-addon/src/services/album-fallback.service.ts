@@ -11,6 +11,7 @@ import type { Database } from 'bun:sqlite';
 
 import { SearchLanes } from './search-lanes.js';
 import { restingPeers } from './peer-rest.js';
+import { isRetryableTransfer } from './retry-policy.js';
 import { SEARCH_TIMEOUT_MS } from './album-hunter.service.js';
 
 const log = createLogger('album-fallback');
@@ -65,11 +66,6 @@ export const ACTIVE_STATES = new Set([
   'Queued, Remotely',
   'Initializing',
   'InProgress',
-]);
-const RETRYABLE_STATES = new Set([
-  'Completed, Errored',
-  'Completed, TimedOut',
-  'Completed, Rejected',
 ]);
 
 const AUDIO_EXTENSIONS = new Set([
@@ -708,7 +704,7 @@ export class AlbumFallbackService {
           }
           // An errored file the retry layer hasn't given up on yet is still in play.
           if (
-            RETRYABLE_STATES.has(file.state) &&
+            isRetryableTransfer(file.state, file.exception) &&
             !gaveUp.has(`${job.username}::${file.filename}`)
           ) {
             return { state: 'working', stalled: [] };

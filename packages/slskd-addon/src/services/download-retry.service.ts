@@ -8,20 +8,14 @@ import { pruneRests, restPeer, restingPeers } from './peer-rest.js';
 import {
   classifyFailure,
   MAX_REST_MS,
+  isRetryableTransfer as isRetryable,
+  remoteSizeFrom,
   retryPolicyFor,
   type RetryDecision,
   type RetryPolicy,
 } from './retry-policy.js';
 
 const log = createLogger('download-retry');
-
-// slskd transfer states that mean the transfer died mid-flight or was rejected.
-// We do NOT retry 'Completed, Cancelled' — that's a deliberate user action.
-const RETRYABLE_SUFFIXES = ['Errored', 'TimedOut', 'Rejected'];
-
-function isRetryable(state: string): boolean {
-  return RETRYABLE_SUFFIXES.some((s) => state === `Completed, ${s}`);
-}
 
 const PRUNE_EVERY_MS = 3_600_000;
 
@@ -148,7 +142,7 @@ export class DownloadRetryService {
               continue;
             }
 
-            if (!isRetryable(file.state)) continue;
+            if (!isRetryable(file.state, file.exception)) continue;
             if (hiddenIds.has(file.id)) continue;
             // A slskd that retries downloads itself has this one in hand.
             if (file.nextAttemptAt && Date.parse(file.nextAttemptAt) > now) continue;
@@ -323,7 +317,9 @@ export class DownloadRetryService {
     this.recordAttempt(key, username, file.filename, spent, now);
     this.db.run('UPDATE transfer_attempts SET retried_at = ? WHERE id = ?', [now, attemptId]);
     try {
-      await this.slskd.transfers.enqueue(username, [{ filename: file.filename, size: file.size }]);
+      // A size-mismatch abort is re-asked at the size the peer now reports.
+      const size = remoteSizeFrom(file.exception) ?? file.size;
+      await this.slskd.transfers.enqueue(username, [{ filename: file.filename, size }]);
     } catch (err) {
       // The attempt still counts (the peer refused it), and the failure is
       // decided again next sweep.

@@ -13,6 +13,11 @@ export type FailureClass =
   | 'connection'
   /** slskd was restarted under the transfer. Never put to the policy: a free retry. */
   | 'shutdown'
+  /**
+   * slskd aborted because the peer's file is no longer the size the search
+   * reported, usually a re-tag since (#28). The peer still has it.
+   */
+  | 'size-mismatch'
   | 'other';
 
 export type RetryDecision =
@@ -41,7 +46,10 @@ export const MAX_REST_MS = 2 * 3_600_000;
  */
 export type RetryPolicy = (reason: FailureClass, retriesSoFar: number) => RetryDecision;
 
+const SIZE_MISMATCH = /remote size of (\d+) does not match expected size/i;
+
 const PATTERNS: Array<[FailureClass, RegExp]> = [
+  ['size-mismatch', SIZE_MISMATCH],
   ['shutdown', /application shut down/i],
   ['not-shared', /not shared/i],
   ['peer-busy', /too many (files|megabytes)|overwhelmed|try again later/i],
@@ -57,8 +65,32 @@ export function classifyFailure(state: string, exception: string | null | undefi
   return state === 'Completed, TimedOut' ? 'timeout' : 'other';
 }
 
+/** The peer's current size, from a size-mismatch abort's message (#28). */
+export function remoteSizeFrom(exception: string | null | undefined): number | null {
+  const m = exception ? SIZE_MISMATCH.exec(exception) : null;
+  const n = m ? Number(m[1]) : NaN;
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+// We do NOT retry 'Completed, Cancelled' — that's a deliberate user action. An
+// abort is otherwise final too, but one on a size mismatch is the peer's file
+// having changed under the search, which the same peer can still serve (#28).
+const RETRYABLE_SUFFIXES = ['Errored', 'TimedOut', 'Rejected'];
+
+/** A finished transfer the retry layer acts on. */
+export function isRetryableTransfer(state: string, exception?: string | null): boolean {
+  if (state === 'Completed, Aborted') return remoteSizeFrom(exception) !== null;
+  return RETRYABLE_SUFFIXES.some((s) => state === `Completed, ${s}`);
+}
+
+/** How long a peer that asked us to back off rests before its file comes back to it. */
+export const PEER_BUSY_REST_MS = 30 * 60_000;
+
+/** Same-peer retry delays for a timeout or a dropped connection, then give up. */
+export const BACKOFF_MS = [30_000, 120_000, 300_000];
+
 /**
- * TODO(owner, #26): the retry table. Measured on kpc, 48 h to 2026-11-05:
+ * The retry table (#26). Measured on kpc, 48 h to 2026-11-05: Measured on kpc, 48 h to 2026-11-05:
  *   not-shared 564 · timeout 118 · peer-busy 130 (Overwhelmed 66 + Too many 64)
  *   and of 122 transfers retried on the same peer, 8 recovered (7%).
  *
@@ -70,10 +102,29 @@ export function classifyFailure(state: string, exception: string | null | undefi
  *   comes back here if nobody delivered it — the move for a peer that asked
  *   us to back off.
  *
- * Until this is written it keeps the pre-#26 rule: a first retry at once,
- * then 60 s apart, three in all.
+ * - not-shared: the peer cannot serve it on any retry → give up now.
+ * - peer-busy: the peer asked us to back off → defer, rest it 30 min.
+ * - timeout / connection: back off on the same peer, 30 s, 2 min, 5 min.
+ * - size-mismatch: one immediate retry at the peer's current size (#28),
+ *   then the fallback; the landing checks guard against another edition.
+ * - other: the pre-#26 rule — at once, then 60 s apart, three in all.
  */
-export const retryPolicyFor: RetryPolicy = (_reason, retriesSoFar) =>
-  retriesSoFar < 3
-    ? { action: 'retry', delayMs: retriesSoFar === 0 ? 0 : 60_000 }
-    : { action: 'give-up' };
+export const retryPolicyFor: RetryPolicy = (reason, retriesSoFar) => {
+  switch (reason) {
+    case 'not-shared':
+      return { action: 'give-up' };
+    case 'peer-busy':
+      return { action: 'defer', restMs: PEER_BUSY_REST_MS };
+    case 'timeout':
+    case 'connection':
+      return retriesSoFar < BACKOFF_MS.length
+        ? { action: 'retry', delayMs: BACKOFF_MS[retriesSoFar] }
+        : { action: 'give-up' };
+    case 'size-mismatch':
+      return retriesSoFar < 1 ? { action: 'retry', delayMs: 0 } : { action: 'give-up' };
+    default:
+      return retriesSoFar < 3
+        ? { action: 'retry', delayMs: retriesSoFar === 0 ? 0 : 60_000 }
+        : { action: 'give-up' };
+  }
+};
