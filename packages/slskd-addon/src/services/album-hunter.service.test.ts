@@ -946,3 +946,49 @@ describe('AlbumHunterService', () => {
     });
   });
 });
+
+describe('a lone retry query fills both lanes (#31)', () => {
+  const GORILLAZ = [track(1, 'Re-Hash'), track(2, '5/4'), track(3, 'Tomorrow Comes Today')];
+  const folder: StubResponse = {
+    username: 'peer',
+    files: GORILLAZ.map((t, i) => ({
+      filename: `Music\\Gorillaz\\Gorillaz\\0${i + 1} ${t.title.replace('/', '_')}.flac`,
+      size: 1_000_000,
+    })),
+  };
+
+  function droppingFirstCopy() {
+    let n = 0;
+    const created: string[] = [];
+    const slskd = {
+      searches: {
+        create: mock(async (q: string) => {
+          created.push(q);
+          return { id: `s-${n++}-${q}`, state: 'Completed' };
+        }),
+        get: mock(async () => ({ state: 'Completed' })),
+        // The banned base pair answers nothing; the FIRST copy of the retry is
+        // dropped by the network, the second one answers twice-over.
+        getResponses: mock(async (id: string) =>
+          id.startsWith('s-3-') ? [folder, folder] : [],
+        ),
+        delete: mock(async () => undefined),
+        cancel: mock(async () => undefined),
+      },
+    } as unknown as Slskd;
+    return { slskd, created };
+  }
+
+  it('fires the self-titled retry on both lanes, so one dropped search is not a miss', async () => {
+    const { slskd, created } = droppingFirstCopy();
+    const res = await new AlbumHunterService(slskd).hunt('Gorillaz', 'Gorillaz', GORILLAZ, {
+      skewSearch: true,
+    });
+    expect(created.slice(2)).toEqual(['*orillaz *orillaz', '*orillaz *orillaz']);
+    expect(res.candidates[0]?.username).toBe('peer');
+    // The copies count as one query, and the peer's folder is not doubled.
+    expect(res.queries).toEqual(['Gorillaz Gorillaz', 'Gorillaz - Gorillaz', '*orillaz *orillaz']);
+    expect(res.searchesFired).toBe(3);
+    expect(res.candidates[0]?.files.length).toBe(GORILLAZ.length);
+  });
+});
