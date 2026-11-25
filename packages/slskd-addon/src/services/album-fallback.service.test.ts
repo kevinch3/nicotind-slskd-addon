@@ -1195,3 +1195,29 @@ describe('AlbumFallbackService — resting peers (#26)', () => {
     expect(enqueue.mock.calls.map((c) => c[0])).toEqual(['freshpeer']);
   });
 });
+
+describe('sweep is single-flight (#27)', () => {
+  it('a sweep fired into a running one joins it instead of starting a second pass', async () => {
+    const db = makeDb();
+    recordJob(db, [ALT]);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const getDownloads = mock(async () => {
+      await gate;
+      return [];
+    });
+    const slskd = { transfers: { getDownloads, enqueue: mock(async () => undefined) } } as unknown as Slskd;
+    const svc = new AlbumFallbackService(slskd, { db, host: NOOP_FALLBACK_HOST });
+
+    const first = svc.sweep();
+    const second = svc.sweep();
+    expect(second).toBe(first);
+    release();
+    await Promise.all([first, second]);
+    expect(getDownloads).toHaveBeenCalledTimes(1);
+
+    // Once the pass ends the next tick runs a fresh one.
+    await svc.sweep();
+    expect(getDownloads).toHaveBeenCalledTimes(2);
+  });
+});
