@@ -362,11 +362,51 @@ export function scoreFolders(
  * `laneWaitMs` is time queued behind other sessions; `aborted` means the
  * caller hung up, so whatever ran was discarded.
  */
+/**
+ * Which of the two base queries found each candidate folder (#25). The base
+ * pair returned response counts within 10% of each other 108 times in 110, but
+ * equal counts are not equal folders: before the second variant is dropped to
+ * free a search lane, the share of hunts where it alone found a folder, and how
+ * good that folder was, has to be near zero. `onlySecondBestPct` is the best
+ * match among the folders only the second query found.
+ */
+export interface BaseAttribution {
+  onlyFirst: number;
+  onlySecond: number;
+  both: number;
+  onlySecondBestPct: number;
+}
+
+export function attributeBaseCandidates(perQuery: FolderCandidate[][]): BaseAttribution | null {
+  if (perQuery.length !== 2) return null;
+  const key = (c: FolderCandidate) => `${c.username}::${c.directory}`;
+  const first = new Set(perQuery[0]!.map(key));
+  const second = new Map(perQuery[1]!.map((c) => [key(c), c.matchPct]));
+  let both = 0;
+  let onlySecond = 0;
+  let onlySecondBestPct = 0;
+  for (const [k, pct] of second) {
+    if (first.has(k)) both++;
+    else {
+      onlySecond++;
+      onlySecondBestPct = Math.max(onlySecondBestPct, pct);
+    }
+  }
+  return { onlyFirst: first.size - both, onlySecond, both, onlySecondBestPct };
+}
+
+interface HuntTrace {
+  startedAt: number | null;
+  waves: number;
+  result: HuntResult | null;
+  baseAttribution: BaseAttribution | null;
+}
+
 function logHuntSummary(
   artist: string,
   album: string,
   queuedAt: number,
-  trace: { startedAt: number | null; waves: number; result: HuntResult | null },
+  trace: HuntTrace,
   opts: { signal?: AbortSignal; attemptId?: string },
 ): void {
   const now = Date.now();
@@ -387,6 +427,7 @@ function logHuntSummary(
       rateLimited: r?.rateLimited ?? false,
       sourceOffline: r?.sourceOffline ?? false,
       aborted: opts.signal?.aborted ?? false,
+      ...(trace.baseAttribution ? { baseAttribution: trace.baseAttribution } : {}),
     },
     'hunt summary',
   );
@@ -423,11 +464,7 @@ export class AlbumHunterService {
     opts: { skewSearch?: boolean; forceSkew?: boolean; signal?: AbortSignal; attemptId?: string } = {},
   ): Promise<HuntResult> {
     const queuedAt = Date.now();
-    const trace: { startedAt: number | null; waves: number; result: HuntResult | null } = {
-      startedAt: null,
-      waves: 0,
-      result: null,
-    };
+    const trace: HuntTrace = { startedAt: null, waves: 0, result: null, baseAttribution: null };
     try {
       return await this.lanes.run(
         'user',
@@ -436,6 +473,9 @@ export class AlbumHunterService {
           const baseQs = baseQueries(artistName, albumTitle);
           const base = await this.wave(baseQs);
           trace.waves++;
+          trace.baseAttribution = attributeBaseCandidates(
+            base.byQuery.map((r) => scoreFolders(canonicalTracks, r)),
+          );
           let candidates = scoreFolders(canonicalTracks, base.responses);
           const bestBasePct = candidates.length ? candidates[0].matchPct : 0;
           const skewNeeded = opts.skewSearch !== false && bestBasePct < SKEW_TRIGGER_PCT;
@@ -589,6 +629,7 @@ export class AlbumHunterService {
     return {
       ...w,
       responses,
+      byQuery: queries.map(() => responses),
       fired: queries.length,
       answered: Math.min(w.answered, queries.length),
     };
@@ -609,6 +650,7 @@ export class AlbumHunterService {
     if (!searchIds.length) {
       return {
         responses: [],
+        byQuery: queries.map(() => []),
         fired: queries.length,
         answered: 0,
         rateLimited: created.some((c) => c.rateLimited),
@@ -617,8 +659,17 @@ export class AlbumHunterService {
     }
 
     try {
-      const { responses, answered } = await this.pollUntilDone(searchIds);
-      return { responses, fired: queries.length, answered, rateLimited, sourceOffline };
+      const { responseSets, answered } = await this.pollUntilDone(searchIds);
+      const bySearch = new Map(searchIds.map((id, i) => [id, responseSets[i] ?? []]));
+      const byQuery = created.map((c) => (c.search ? (bySearch.get(c.search.id) ?? []) : []));
+      return {
+        responses: responseSets.flat(),
+        byQuery,
+        fired: queries.length,
+        answered,
+        rateLimited,
+        sourceOffline,
+      };
     } finally {
       // Clean up searches (bounded — the same burst that 429s creates also 429s
       // deletes, and leaked searches pile up in slskd's history). A search still
@@ -631,7 +682,7 @@ export class AlbumHunterService {
 
   private async pollUntilDone(
     searchIds: string[],
-  ): Promise<{ responses: ScoreResponse[]; answered: number }> {
+  ): Promise<{ responseSets: ScoreResponse[][]; answered: number }> {
     const deadline = Date.now() + this.waveTimeoutMs;
     let states: Array<{ state: string } | null> = [];
 
@@ -653,7 +704,7 @@ export class AlbumHunterService {
       searchIds.map((id) => this.slskd.searches.getResponses(id).catch(() => [])),
     );
 
-    return { responses: responseSets.flat(), answered };
+    return { responseSets, answered };
   }
 }
 
@@ -664,6 +715,8 @@ function searchIsDone(state: string): boolean {
 
 interface WaveResult {
   responses: ScoreResponse[];
+  /** Each query's own responses, in query order (empty for one never created). */
+  byQuery: ScoreResponse[][];
   fired: number;
   answered: number;
   rateLimited: boolean;
