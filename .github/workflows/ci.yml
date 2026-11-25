@@ -27,6 +27,8 @@ jobs:
 
   docker:
     name: image
+    # A red test run publishes nothing: :latest is what the host deploy pulls (#32).
+    needs: ci
     runs-on: ubuntu-latest
     permissions:
       contents: read
