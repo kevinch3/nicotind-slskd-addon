@@ -84,6 +84,53 @@ describe('addon job store', () => {
     expect(item.audioFormat).toBe('FLAC');
   });
 
+  // #2: El salmón (5 CDs, 103 files) repeats two titles on other discs, and
+  // the second file of each overwrote the first's ledger row.
+  function seedRepeatedTitle(id = 'job-r'): string {
+    createAddonJob(db, { id, intent: 'album', artist: 'A', album: 'B', albumJobId: 8 });
+    addJobItems(
+      db,
+      id,
+      ['CD1\\05 Revolución Turra.flac', 'CD1\\06 Other.flac', 'CD4\\02 Revolucion turra.flac'].map(
+        (filename, i) => ({
+          itemId: itemIdForTitle(i === 1 ? 'Other' : 'Revolución turra'),
+          title: i === 1 ? 'Other' : 'Revolución turra',
+          username: 'peer',
+          filename,
+          size: 1,
+        }),
+      ),
+    );
+    return id;
+  }
+
+  it('a title the release repeats gets one ledger item per file', () => {
+    const items = getAddonJob(db, seedRepeatedTitle())!.items;
+    expect(items).toHaveLength(3);
+    expect(items.map((i) => i.itemId).sort()).toEqual([
+      't:other',
+      't:revolucion turra',
+      't:revolucion turra#2',
+    ]);
+    expect(items.find((i) => i.itemId === 't:revolucion turra#2')!.filename).toBe(
+      'CD4\\02 Revolucion turra.flac',
+    );
+  });
+
+  it('a re-pull of a repeated title repoints its first sibling not yet completed', () => {
+    const id = seedRepeatedTitle();
+    markItemsCompletedByTransfer(db, [
+      { username: 'peer', filename: 'CD1\\05 Revolución Turra.flac', fileReady: true },
+    ]);
+    expect(
+      repointJobItem(db, id, 't:revolucion turra', { username: 'alt', filename: 'x\\Revolución Turra.flac' }),
+    ).toBe(true);
+    const items = getAddonJob(db, id)!.items;
+    expect(items).toHaveLength(3);
+    expect(items.find((i) => i.itemId === 't:revolucion turra')!.username).toBe('peer');
+    expect(items.find((i) => i.itemId === 't:revolucion turra#2')!.username).toBe('alt');
+  });
+
   it('completion sync flips matching items and recomputes job state', () => {
     const id = seedAlbumJob();
     markItemsCompletedByTransfer(db, [

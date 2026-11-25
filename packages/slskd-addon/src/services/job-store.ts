@@ -92,7 +92,7 @@ export function createAddonJob(
 
 export function addJobItems(db: Database, jobId: string, items: NewJobItem[]): void {
   const now = Date.now();
-  for (const item of items) {
+  for (const item of disambiguate(items)) {
     db.run(
       `INSERT INTO addon_job_items (job_id, item_id, title, username, filename, size, bit_rate_kbps, audio_format, state, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
@@ -118,8 +118,25 @@ export function addJobItems(db: Database, jobId: string, items: NewJobItem[]): v
 }
 
 /**
+ * Two files of one batch with the same id (a title a release really repeats,
+ * on another disc) become `<id>`, `<id>#2`, … in enqueue order, instead of the
+ * second overwriting the first's coordinates: 103 enqueued files of a 5-CD
+ * album left 100 ledger items (#2). The first keeps the bare id, so a release
+ * with no repeat is keyed exactly as before.
+ */
+function disambiguate(items: NewJobItem[]): NewJobItem[] {
+  const seen = new Map<string, number>();
+  return items.map((item) => {
+    const n = (seen.get(item.itemId) ?? 0) + 1;
+    seen.set(item.itemId, n);
+    return n === 1 ? item : { ...item, itemId: `${item.itemId}#${n}` };
+  });
+}
+
+/**
  * A fallback wave re-pulled a titled item from another peer: same itemId, new
- * transfer coordinates, state back to queued.
+ * transfer coordinates, state back to queued. A title the release repeats has
+ * siblings (`<id>#2`, #2): the re-pull goes to the first one not yet completed.
  */
 export function repointJobItem(
   db: Database,
@@ -128,6 +145,13 @@ export function repointJobItem(
   next: { username: string; filename: string; bitRateKbps?: number; audioFormat?: string },
 ): boolean {
   const now = Date.now();
+  const target = db
+    .query(
+      `SELECT item_id FROM addon_job_items
+       WHERE job_id = ? AND (item_id = ? OR substr(item_id, 1, length(?) + 1) = ? || '#')
+       ORDER BY state = 'completed', rowid LIMIT 1`,
+    )
+    .get(jobId, itemId, itemId, itemId) as { item_id: string } | null;
   const { changes } = db.run(
     `UPDATE addon_job_items
      SET username = ?, filename = ?, bit_rate_kbps = COALESCE(?, bit_rate_kbps),
@@ -141,7 +165,7 @@ export function repointJobItem(
       next.audioFormat ?? null,
       now,
       jobId,
-      itemId,
+      target?.item_id ?? itemId,
     ],
   );
   touchJob(db, jobId, now);
