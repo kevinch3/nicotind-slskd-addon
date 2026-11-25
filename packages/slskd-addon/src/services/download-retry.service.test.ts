@@ -624,3 +624,45 @@ describe('DownloadRetryService', () => {
     });
   });
 });
+
+describe('a size-mismatch abort (#28)', () => {
+  const ABORT =
+    'Transfer aborted: the remote size of 12124447 does not match expected size 12624200';
+
+  it('is re-enqueued once on the same peer, at the size the peer now reports', async () => {
+    const db = makeDb();
+    const { slskd, enqueue, fail } = makeSlskdMock([
+      { id: 'a', filename: 'Album/01.flac', size: 12_624_200, state: 'Completed, Succeeded' },
+    ]);
+    fail('Album/01.flac', ABORT, 'Completed, Aborted');
+    const svc = new DownloadRetryService(slskd, { db });
+
+    await svc.sweep();
+    expect(enqueue).toHaveBeenCalledWith('peer', [{ filename: 'Album/01.flac', size: 12_124_447 }]);
+    expect(attemptRows(db, 'peer::Album/01.flac')[0]).toMatchObject({
+      failure_class: 'size-mismatch',
+      decision: 'retry',
+    });
+
+    // It aborts again: the fallback gets it.
+    fail('Album/01.flac', ABORT, 'Completed, Aborted');
+    await svc.sweep();
+    expect(enqueue).toHaveBeenCalledTimes(1);
+    expect(retryRow(db, 'peer::Album/01.flac')?.gave_up).toBe(1);
+  });
+
+  it('any other abort is left alone', async () => {
+    const db = makeDb();
+    const { slskd, enqueue } = makeSlskdMock([
+      {
+        id: 'a',
+        filename: 'Album/01.flac',
+        size: 100,
+        state: 'Completed, Aborted',
+        exception: 'Transfer aborted',
+      },
+    ]);
+    await new DownloadRetryService(slskd, { db }).sweep();
+    expect(enqueue).not.toHaveBeenCalled();
+  });
+});

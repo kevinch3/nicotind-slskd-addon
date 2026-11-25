@@ -28,7 +28,7 @@ cannot be helped by waiting for the same peer:
 | `Verification required` | 14 | `other` |
 
 `classifyFailure(state, exception)` (`retry-policy.ts`) maps slskd's `exception` text to a class:
-`not-shared`, `peer-busy`, `timeout`, `connection`, `shutdown` or `other`. A `Completed, TimedOut`
+`not-shared`, `peer-busy`, `timeout`, `connection`, `shutdown`, `size-mismatch` or `other`. A `Completed, TimedOut`
 with no text is a `timeout`; anything else unrecognised is `other`, never a guess.
 
 The retryable failures slskd still listed on kpc on 2026-11-06 (read from its API, numbers
@@ -44,8 +44,18 @@ collapsed), by class:
 | `other` | 78 | `File read error.` (32), `Download reported as failed by remote client` (19), `Cancelled` (13), `Verification required…` (14) |
 
 `retryPolicyFor(reason, retriesSoFar)` maps a class to `{ action: 'retry', delayMs }`,
-`{ action: 'give-up' }` or `{ action: 'defer', restMs }`. It is owner-written policy. Until it is
-written, it keeps the pre-#26 rule: a first retry at once, then 60 s apart, three in all.
+`{ action: 'give-up' }` or `{ action: 'defer', restMs }`:
+
+| class | decision | why |
+| --- | --- | --- |
+| `not-shared` | give up at once | no retry on the same peer can serve a file it does not share |
+| `peer-busy` | defer, rest the peer 30 min | the peer asked us to back off; another peer first |
+| `timeout`, `connection` | retry after 30 s, 2 min, 5 min, then give up | transient, and slskd 0.26 has already retried it quickly |
+| `size-mismatch` | one retry at once, at the peer's current size, then give up | the peer still has the file (#28) |
+| `other` | the pre-#26 rule: at once, then 60 s apart, three in all | unclassified, so unchanged |
+
+`shutdown` and any failure seen while Soulseek is offline never reach the table: they get a free
+retry.
 
 How the service applies a decision:
 
@@ -151,13 +161,16 @@ If slskd is upgraded and its own retry is turned on, a transfer it will retry ca
 in the future. This service leaves such a transfer alone until then, so two layers never retry one
 transfer.
 
-**Two gaps this does not close.** Both were measured on 2026-11-06 against the addon database
+**Two gaps found on that check.** Both were measured on 2026-11-06 against the addon database
 (read-only, counts only):
 
 - **`Completed, Aborted`** (#28). There are 118 listed, all reading "the remote size of N does not
-  match expected size N". The peer's file changed size after the search, and nothing retries an
-  abort. **None of the 118 belongs to an open job**, so this is the fix for future aborts, not a
-  backlog to recover.
+  match expected size N". The peer's file changed size after the search. **None of the 118 belongs
+  to an open job**, but after the 0.26.2 upgrade 3 of the first 77 transfers aborted this way in
+  live jobs. Such an abort is now the `size-mismatch` class: `isRetryableTransfer` accepts it (any
+  other abort stays final), it is re-enqueued once on the same peer with the size parsed from the
+  message (`remoteSizeFrom`), and the album fallback counts it as still in play until it gives up.
+  The landing checks guard against the peer's current file being another edition.
 - **`Completed, Cancelled`**. There are 270 listed. **Only 1** carries a retry row that was never
   given up, which is the signature of the removed cancel-then-refused-enqueue. The other 269 were
   never touched by this service, and none belongs to an open job.
