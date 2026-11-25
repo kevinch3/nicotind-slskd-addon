@@ -3,6 +3,7 @@ import type { Slskd } from '@nicotind/slskd-client';
 import { buildTrackQueries, pickBestTrackFile, type TrackPick } from './track-pick.js';
 
 import { SearchLanes } from './search-lanes.js';
+import { retireSearch } from './search-retire.js';
 import { SEARCH_TIMEOUT_MS } from './album-hunter.service.js';
 
 const log = createLogger('track-hunter');
@@ -135,7 +136,7 @@ export class TrackHunterService {
       const responses = await this.slskd.searches.getResponses(search.id).catch(() => []);
       return pickBestTrackFile(responses, title);
     } finally {
-      await this.slskd.searches.delete(search.id).catch(() => {});
+      await retireSearch(this.slskd, search.id, { pollMs: this.pollMs });
     }
   }
 }
