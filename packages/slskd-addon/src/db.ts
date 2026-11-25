@@ -46,6 +46,43 @@ export function applySchema(db: Database): void {
     )
   `);
 
+  // One row per failed transfer the retry layer saw, kept after success: the
+  // data a retry delay is chosen from (#26, docs/download-retries.md).
+  db.run(`
+    CREATE TABLE IF NOT EXISTS transfer_attempts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      transfer_key TEXT NOT NULL,
+      transfer_id TEXT NOT NULL,
+      username TEXT NOT NULL,
+      filename TEXT NOT NULL,
+      directory TEXT,
+      state TEXT NOT NULL,
+      exception TEXT,
+      failure_class TEXT NOT NULL,
+      retries_before INTEGER NOT NULL,
+      source_attempts INTEGER,
+      source_offline INTEGER NOT NULL DEFAULT 0,
+      decision TEXT NOT NULL,
+      delay_ms INTEGER,
+      failed_at INTEGER NOT NULL,
+      retried_at INTEGER,
+      outcome TEXT
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_transfer_attempts_failed_at ON transfer_attempts (failed_at)`);
+  db.run(
+    `CREATE INDEX IF NOT EXISTS idx_transfer_attempts_key ON transfer_attempts (transfer_key, transfer_id)`,
+  );
+
+  // Peers resting after a deferred failure (#26): retries and the fallback wait.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS peer_rest (
+      username TEXT PRIMARY KEY,
+      until INTEGER NOT NULL,
+      reason TEXT
+    )
+  `);
+
   db.run(`
     CREATE TABLE IF NOT EXISTS hidden_transfers (
       id TEXT PRIMARY KEY,

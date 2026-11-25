@@ -41,7 +41,9 @@ export type SlskdTransferState =
   | 'Completed, Cancelled'
   | 'Completed, TimedOut'
   | 'Completed, Errored'
-  | 'Completed, Rejected';
+  | 'Completed, Rejected'
+  /** e.g. "the remote size of N does not match expected size N" */
+  | 'Completed, Aborted';
 
 export interface SlskdTransfer {
   id: string;
@@ -54,6 +56,12 @@ export interface SlskdTransfer {
   percentComplete: number;
   startedAt?: string;
   endedAt?: string;
+  /** Why a transfer that did not succeed ended, e.g. "Transfer rejected: File not shared." */
+  exception?: string | null;
+  /** When slskd itself will retry this transfer; set only by slskd versions that retry downloads. */
+  nextAttemptAt?: string | null;
+  /** Attempts slskd itself made (0.26+ retries transient failures before reporting one). */
+  attempts?: number;
 }
 
 export interface SlskdTransferDirectory {

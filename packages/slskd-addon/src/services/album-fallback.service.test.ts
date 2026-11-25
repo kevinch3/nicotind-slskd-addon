@@ -8,6 +8,7 @@ import {
 } from './album-fallback.service.js';
 import { SlskdRequestError, type Slskd } from '@nicotind/slskd-client';
 import type { SearchLanes } from './search-lanes.js';
+import { restPeer } from './peer-rest.js';
 
 interface MockFile {
   id: string;
@@ -1090,5 +1091,107 @@ describe('AlbumFallbackService — a neighbouring title is not the missing one (
     await new AlbumFallbackService(slskd, { db, host: NOOP_FALLBACK_HOST }).sweep();
     expect(enqueue).not.toHaveBeenCalled();
     expect(attempts(db)).toBe(1);
+  });
+});
+
+describe('AlbumFallbackService — resting peers (#26)', () => {
+  let db: Database;
+  beforeEach(() => {
+    db = makeDb();
+    db.run(
+      `INSERT INTO transfer_retries (transfer_key, username, filename, attempts, gave_up) VALUES
+       ('primary::Album/02 Song Two.flac', 'primary', 'x', 3, 1),
+       ('primary::Album/03 Song Three.flac', 'primary', 'x', 3, 1)`,
+    );
+  });
+
+  const PRIMARY_GAVE_UP = [
+    {
+      username: 'primary',
+      directory: 'Album',
+      files: [
+        { id: 'p1', filename: 'Album/01 Song One.flac', size: 1, state: 'Completed, Succeeded' },
+        { id: 'p2', filename: 'Album/02 Song Two.flac', size: 1, state: 'Completed, Errored' },
+        { id: 'p3', filename: 'Album/03 Song Three.flac', size: 1, state: 'Completed, Errored' },
+      ],
+    },
+  ];
+  const ALT2: AlternateCandidate = {
+    username: 'alt2',
+    directory: 'Alt2Album',
+    files: [
+      { filename: 'Alt2Album/02 Song Two.flac', size: 1 },
+      { filename: 'Alt2Album/03 Song Three.flac', size: 1 },
+    ],
+  };
+
+  function alternates(): string[] {
+    const row = db.query('SELECT alternates_json AS a FROM album_jobs WHERE id = 1').get() as {
+      a: string;
+    };
+    return (JSON.parse(row.a) as AlternateCandidate[]).map((a) => a.username);
+  }
+
+  it('passes over a resting alternate without using it up', async () => {
+    const { slskd, enqueue } = makeSlskd(PRIMARY_GAVE_UP);
+    recordJob(db, [ALT, ALT2]);
+    restPeer(db, 'alt', 10_000, 'peer-busy');
+
+    const svc = new AlbumFallbackService(slskd, { db, host: NOOP_FALLBACK_HOST, now: () => 0 });
+    await svc.sweep();
+
+    expect(enqueue.mock.calls.map((c) => c[0])).toEqual(['alt2']);
+    expect(alternates()).toEqual(['alt']);
+  });
+
+  // The cheapest alternate is resting, not gone: a fresh search would spend
+  // lane time on what the recorded peer can supply once its rest ends.
+  it('waits out the rest when only a resting alternate has the tracks', async () => {
+    let now = 0;
+    const { slskd, enqueue } = makeSlskd(PRIMARY_GAVE_UP);
+    recordJob(db, [ALT]);
+    restPeer(db, 'alt', 10_000, 'peer-busy');
+    const svc = new AlbumFallbackService(slskd, { db, host: NOOP_FALLBACK_HOST, now: () => now });
+
+    await svc.sweep();
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(attempts(db)).toBe(0);
+    expect(jobState(db)).toBe('active');
+
+    now = 10_000;
+    await svc.sweep();
+    expect(enqueue.mock.calls.map((c) => c[0])).toEqual(['alt']);
+  });
+
+  it('a fresh search passes over a resting peer', async () => {
+    const { slskd, enqueue } = makeSlskdWithSearch(PRIMARY_GAVE_UP.slice(), [
+      {
+        username: 'busypeer',
+        freeUploadSlots: 5,
+        uploadSpeed: 9_000_000,
+        files: [{ filename: 'X/02 Song Two.flac', size: 1 }],
+      },
+      {
+        username: 'freshpeer',
+        freeUploadSlots: 1,
+        uploadSpeed: 1000,
+        files: [{ filename: 'Y/02 Song Two.flac', size: 1 }],
+      },
+    ]);
+    AlbumFallbackService.recordJob(db, {
+      lidarrAlbumId: 1,
+      username: 'primary',
+      directory: 'Album',
+      artistName: 'Artist',
+      canonicalTracks: ['Song One', 'Song Two'],
+      targetFiles: [{ filename: 'Album/01 Song One.flac' }, { filename: 'Album/02 Song Two.flac' }],
+      alternates: [],
+    });
+    restPeer(db, 'busypeer', 10_000, 'peer-busy');
+
+    const svc = new AlbumFallbackService(slskd, { db, host: NOOP_FALLBACK_HOST, now: () => 0 });
+    await svc.sweep();
+
+    expect(enqueue.mock.calls.map((c) => c[0])).toEqual(['freshpeer']);
   });
 });

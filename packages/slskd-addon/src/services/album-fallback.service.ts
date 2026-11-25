@@ -10,6 +10,7 @@ import { SlskdRequestError, type Slskd } from '@nicotind/slskd-client';
 import type { Database } from 'bun:sqlite';
 
 import { SearchLanes } from './search-lanes.js';
+import { restingPeers } from './peer-rest.js';
 import { SEARCH_TIMEOUT_MS } from './album-hunter.service.js';
 
 const log = createLogger('album-fallback');
@@ -58,7 +59,7 @@ export const NOOP_FALLBACK_HOST: FallbackHost = {
 // Transfer states that mean the primary peer is still actively working a track.
 // While any of these hold for the primary folder we let auto-retry run before
 // reaching for an alternate peer.
-const ACTIVE_STATES = new Set([
+export const ACTIVE_STATES = new Set([
   'Requested',
   'Queued, Locally',
   'Queued, Remotely',
@@ -315,6 +316,8 @@ export class AlbumFallbackService {
       if (!seenKeys.has(key)) this.progress.delete(key);
     }
 
+    const resting = restingPeers(this.db, this.now());
+
     for (const job of jobs) {
       // Nobody will ingest what this job recovers: the host released (or a
       // person removed) the unified job. On kpc one such row swept for days,
@@ -374,9 +377,22 @@ export class AlbumFallbackService {
         continue;
       }
 
+      // A peer that asked us to back off is passed over, not used up (#26).
+      // Only a resting peer has these tracks: wait out its rest rather than
+      // paying lane time for a search it would answer anyway.
+      const alternates = JSON.parse(job.alternates_json) as AlternateCandidate[];
+      const usable = alternates.filter((a) => !resting.has(a.username));
+      if (
+        usable.length < alternates.length &&
+        !pickAlternate(usable, wanted, canonical) &&
+        pickAlternate(alternates, wanted, canonical)
+      ) {
+        continue;
+      }
+
       // Cheapest path first: pull from a recorded alternate folder if one covers
       // a missing track. Only when none does do we pay for a fresh network search.
-      if ((await this.pullFromAlternate(job, wanted, canonical)) !== null) continue;
+      if ((await this.pullFromAlternate(job, wanted, canonical, resting)) !== null) continue;
 
       // No recorded alternate covers the gap. Legacy jobs (no artist recorded)
       // have nothing left to try — give up, preserving the old behavior.
@@ -531,6 +547,7 @@ export class AlbumFallbackService {
 
       const responses = await this.slskd.searches.getResponses(search.id).catch(() => []);
       const normTitle = normalizeTitle(title);
+      const resting = restingPeers(this.db, this.now());
 
       let best: {
         username: string;
@@ -540,6 +557,7 @@ export class AlbumFallbackService {
       } | null = null;
 
       for (const response of responses) {
+        if (resting.has(response.username)) continue;
         const peerScore = healthScore(response);
         for (const file of response.files) {
           const ext = file.filename.slice(file.filename.lastIndexOf('.')).toLowerCase();
@@ -599,9 +617,11 @@ export class AlbumFallbackService {
     job: AlbumJobRow,
     recoverable: string[],
     canonical: string[],
+    resting: ReadonlySet<string> = new Set(),
   ): Promise<string[] | 'refused' | 'unreachable' | null> {
     const alternates = JSON.parse(job.alternates_json) as AlternateCandidate[];
-    const picked = pickAlternate(alternates, recoverable, canonical);
+    const usable = alternates.filter((a) => !resting.has(a.username));
+    const picked = pickAlternate(usable, recoverable, canonical);
     if (!picked) return null;
     const remaining = alternates.filter((a) => a !== picked.alternate);
     try {
@@ -713,7 +733,12 @@ export class AlbumFallbackService {
     stalled: Array<{ id: string; filename: string }>,
   ): Promise<void> {
     if (job.fallback_attempts >= this.maxFallbackAttempts) return;
-    const pulled = await this.pullFromAlternate(job, recoverable, canonical);
+    const pulled = await this.pullFromAlternate(
+      job,
+      recoverable,
+      canonical,
+      restingPeers(this.db, this.now()),
+    );
     if (!Array.isArray(pulled)) return;
     const taken = recoverable.filter(
       (t) => unownedTargets([t], canonical, pulled.map(normalizeBasename)).length === 0,
