@@ -461,7 +461,7 @@ export class AlbumHunterService {
             const bestPct = candidates.length ? candidates[0].matchPct : 0;
             if (bestPct >= SKEW_TRIGGER_PCT || acc.sourceOffline || opts.signal?.aborted) break;
             const chunk = skewed.slice(i, i + SEARCH_LANES);
-            const w = await this.wave(chunk);
+            const w = await this.redundantWave(chunk);
             trace.waves++;
             candidates = mergeCandidates(candidates, scoreFolders(canonicalTracks, w.responses));
             acc.candidates = candidates;
@@ -533,7 +533,7 @@ export class AlbumHunterService {
         const bestPct = acc.candidates.length ? acc.candidates[0].matchPct : 0;
         if (bestPct >= SKEW_TRIGGER_PCT || acc.sourceOffline) break;
         const chunk = skewed.slice(i, i + SEARCH_LANES);
-        const w = await this.wave(chunk);
+        const w = await this.redundantWave(chunk);
         acc.candidates = mergeCandidates(acc.candidates, scoreFolders(canonicalTracks, w.responses));
         acc.queries.push(...chunk);
         acc.searchesFired += w.fired;
@@ -568,6 +568,30 @@ export class AlbumHunterService {
         return { search: null, rateLimited: is429, sourceOffline };
       }
     }
+  }
+
+  // A wave with fewer queries than lanes fires its lone query on every idle
+  // lane too. Soulseek drops ~13% of searches at random and a dropped search
+  // still reads `Completed` with nothing in it, so a self-titled album by a
+  // banned artist, whose retries de-dupe to one query, would otherwise record a
+  // genuine miss about 1 hunt in 8 (#31). The copies count as one query, and
+  // one peer's answer is kept once.
+  private async redundantWave(queries: string[]): Promise<WaveResult> {
+    if (!queries.length || queries.length >= SEARCH_LANES) return this.wave(queries);
+    const copies = Array.from({ length: SEARCH_LANES }, (_, i) => queries[i % queries.length]);
+    const w = await this.wave(copies);
+    const seen = new Set<string>();
+    const responses = w.responses.filter((r) => {
+      if (seen.has(r.username)) return false;
+      seen.add(r.username);
+      return true;
+    });
+    return {
+      ...w,
+      responses,
+      fired: queries.length,
+      answered: Math.min(w.answered, queries.length),
+    };
   }
 
   // The I/O half of one wave: create the searches, poll to completion, clean
