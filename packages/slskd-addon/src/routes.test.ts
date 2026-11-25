@@ -138,6 +138,26 @@ describe('addon protocol routes', () => {
     expect(body.searchesAnswered).toBe(body.searchesFired);
   });
 
+  // #24: a host that timed out has closed the request. The hunt must leave the
+  // lane queue instead of running for nobody.
+  it('albums/search never searches for a request that was already abandoned', async () => {
+    const fired: string[] = [];
+    h.slskdRef.current.searches.create = async (q: string) => {
+      fired.push(q);
+      return { id: `s-${q}`, state: 'Completed' } as never;
+    };
+    const ac = new AbortController();
+    ac.abort();
+    const res = await h.app.request(
+      new Request('http://addon/addon/v1/albums/search', {
+        ...json({ artist: 'Artist', album: 'Album', canonicalTracks: [{ title: 'Song One' }] }),
+        signal: ac.signal,
+      }),
+    );
+    expect(res.status).toBe(499);
+    expect(fired).toEqual([]);
+  });
+
   // The route used to pass `skewSearch: undefined`, which the hunter read as
   // "no skew" — so a hunt whose base missed never fired a skew wave on prod.
   it('albums/search runs the skew waves when the base pair misses', async () => {

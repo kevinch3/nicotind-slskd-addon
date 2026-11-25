@@ -28,9 +28,29 @@ export class SearchLanes {
     return this.busy;
   }
 
-  async run<T>(priority: LanePriority, fn: () => Promise<T>): Promise<T> {
+  /**
+   * `signal` is the caller's: once it aborts, a session still waiting leaves the
+   * queue and never takes the lanes. A host that timed out a hunt has already
+   * discarded its answer, so running it would only delay every session behind
+   * it (#24).
+   */
+  async run<T>(priority: LanePriority, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    signal?.throwIfAborted();
     if (this.busy) {
-      await new Promise<void>((resolve) => this.waiting[priority].push(resolve));
+      await new Promise<void>((resolve, reject) => {
+        const queue = this.waiting[priority];
+        const onAbort = () => {
+          const at = queue.indexOf(take);
+          if (at >= 0) queue.splice(at, 1);
+          reject(signal!.reason);
+        };
+        const take = () => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve();
+        };
+        queue.push(take);
+        signal?.addEventListener('abort', onAbort, { once: true });
+      });
     }
     this.busy = true;
     try {
